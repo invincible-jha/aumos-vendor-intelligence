@@ -476,3 +476,336 @@ class IInsuranceGapRepository(Protocol):
             Updated InsuranceGap.
         """
         ...
+
+
+# ---------------------------------------------------------------------------
+# Interfaces for domain-specific analytics adapters
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IBenchmarkingRunner(Protocol):
+    """Interface for cross-provider benchmark execution."""
+
+    async def run_latency_benchmark(
+        self,
+        vendor_ids: list[uuid.UUID],
+        prompt_payloads: list[dict[str, Any]],
+        timeout_seconds: float,
+    ) -> dict[str, Any]:
+        """Measure end-to-end latency across vendors for identical prompts."""
+        ...
+
+    async def compare_cost_per_token(
+        self,
+        vendor_ids: list[uuid.UUID],
+        model_tiers: dict[str, str],
+        token_volume: int,
+    ) -> dict[str, Any]:
+        """Compare cost-per-token across vendors for equivalent model tiers."""
+        ...
+
+    async def score_output_quality(
+        self,
+        vendor_outputs: dict[str, list[str]],
+        reference_outputs: list[str],
+    ) -> dict[str, Any]:
+        """Score output quality (BLEU-proxy, semantic similarity, coherence)."""
+        ...
+
+    async def measure_throughput(
+        self,
+        vendor_ids: list[uuid.UUID],
+        requests_per_second: float,
+        duration_seconds: int,
+    ) -> dict[str, Any]:
+        """Measure sustained request throughput and error rates under load."""
+        ...
+
+    async def generate_comparison_report(
+        self,
+        benchmark_results: dict[str, Any],
+        tenant_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Compile all benchmark results into a structured comparison report."""
+        ...
+
+
+@runtime_checkable
+class IContractAnalyzer(Protocol):
+    """Interface for contract text analysis and risk extraction."""
+
+    async def extract_sla_terms(
+        self,
+        contract_text: str,
+    ) -> dict[str, Any]:
+        """Extract SLA commitments (uptime, latency, support response time)."""
+        ...
+
+    async def parse_pricing_structure(
+        self,
+        contract_text: str,
+    ) -> dict[str, Any]:
+        """Parse pricing models (per-token, per-request, subscription tiers)."""
+        ...
+
+    async def analyze_termination_clauses(
+        self,
+        contract_text: str,
+    ) -> dict[str, Any]:
+        """Identify termination triggers, notice periods, and exit obligations."""
+        ...
+
+    async def detect_liability_limitations(
+        self,
+        contract_text: str,
+        annual_contract_value_usd: float | None,
+    ) -> dict[str, Any]:
+        """Detect liability cap clauses and assess AumOS 88% policy compliance."""
+        ...
+
+    async def compare_contracts(
+        self,
+        contract_texts: list[str],
+        contract_ids: list[uuid.UUID],
+    ) -> dict[str, Any]:
+        """Side-by-side comparison of multiple contracts on key risk dimensions."""
+        ...
+
+    async def generate_key_terms_summary(
+        self,
+        contract_text: str,
+    ) -> dict[str, Any]:
+        """Produce an executive-level plain-language summary of key contract terms."""
+        ...
+
+
+@runtime_checkable
+class IFallbackRouter(Protocol):
+    """Interface for vendor health monitoring and automatic failover routing."""
+
+    async def register_vendor(
+        self,
+        vendor_id: uuid.UUID,
+        priority: int,
+        health_endpoint: str | None,
+    ) -> None:
+        """Register a vendor in the routing pool with a priority rank."""
+        ...
+
+    async def select_vendor(
+        self,
+        tenant_id: uuid.UUID,
+        excluded_vendor_ids: list[uuid.UUID] | None,
+    ) -> uuid.UUID | None:
+        """Select the highest-priority healthy vendor for routing."""
+        ...
+
+    async def record_vendor_outcome(
+        self,
+        vendor_id: uuid.UUID,
+        success: bool,
+        latency_ms: float,
+    ) -> None:
+        """Record a request outcome to update vendor health state."""
+        ...
+
+    async def get_vendor_status_dashboard(self) -> dict[str, Any]:
+        """Return a health summary for all registered vendors."""
+        ...
+
+
+@runtime_checkable
+class IArbitrageDetector(Protocol):
+    """Interface for vendor pricing arbitrage and cost-quality optimisation."""
+
+    async def compare_pricing_for_equivalent_models(
+        self,
+        vendor_pricing: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compare per-token pricing across vendors for equivalent capability tiers."""
+        ...
+
+    async def compute_cost_quality_pareto(
+        self,
+        vendor_scores: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compute the Pareto frontier of cost vs quality across vendors."""
+        ...
+
+    async def detect_spot_pricing_opportunities(
+        self,
+        vendor_id: uuid.UUID,
+        historical_pricing: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Identify time-based pricing patterns and spot pricing windows."""
+        ...
+
+    async def generate_savings_report(
+        self,
+        tenant_id: uuid.UUID,
+        current_vendor_id: uuid.UUID,
+        candidate_vendors: list[uuid.UUID],
+        monthly_token_volume: int,
+    ) -> dict[str, Any]:
+        """Estimate potential savings from switching or blending vendors."""
+        ...
+
+
+@runtime_checkable
+class ISLAMonitor(Protocol):
+    """Interface for ongoing SLA compliance tracking and alerting."""
+
+    async def record_health_check(
+        self,
+        vendor_id: uuid.UUID,
+        is_up: bool,
+        latency_ms: float,
+        error_code: str | None,
+        checked_at: datetime,
+    ) -> None:
+        """Record a health check result for a vendor."""
+        ...
+
+    async def get_uptime_percent(
+        self,
+        vendor_id: uuid.UUID,
+        window_hours: int,
+    ) -> float:
+        """Compute vendor uptime percentage over a rolling window."""
+        ...
+
+    async def get_latency_percentiles(
+        self,
+        vendor_id: uuid.UUID,
+        window_hours: int,
+    ) -> dict[str, float]:
+        """Return P50, P95, and P99 latency values over a rolling window."""
+        ...
+
+    async def generate_sla_compliance_report(
+        self,
+        vendor_id: uuid.UUID,
+        period_days: int,
+        sla_thresholds: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Generate a detailed SLA compliance report for a vendor."""
+        ...
+
+
+@runtime_checkable
+class IProcurementAdvisor(Protocol):
+    """Interface for vendor shortlisting and procurement guidance."""
+
+    async def match_requirements_to_vendors(
+        self,
+        requirements: dict[str, Any],
+        available_vendors: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        """Match procurement requirements to eligible vendors."""
+        ...
+
+    async def score_vendors_multi_criteria(
+        self,
+        vendors: list[dict[str, Any]],
+        scoring_weights: dict[str, float] | None,
+    ) -> list[dict[str, Any]]:
+        """Score vendors across cost, quality, reliability, compliance, support."""
+        ...
+
+    async def generate_shortlist(
+        self,
+        scored_vendors: list[dict[str, Any]],
+        top_n: int,
+    ) -> dict[str, Any]:
+        """Generate a ranked vendor shortlist with justifications."""
+        ...
+
+    async def prepare_rfp_template(
+        self,
+        requirements: dict[str, Any],
+        shortlisted_vendor_ids: list[uuid.UUID],
+    ) -> dict[str, Any]:
+        """Generate an RFP template tailored to the requirement profile."""
+        ...
+
+    async def generate_comparison_matrix(
+        self,
+        scored_vendors: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Produce a side-by-side vendor comparison matrix."""
+        ...
+
+
+@runtime_checkable
+class IVendorDataEnricher(Protocol):
+    """Interface for vendor profile enrichment from external sources."""
+
+    async def extract_pricing_page_data(
+        self,
+        vendor_id: uuid.UUID,
+        pricing_url: str,
+    ) -> dict[str, Any]:
+        """Extract pricing tiers and model costs from a vendor pricing page."""
+        ...
+
+    async def compile_feature_matrix(
+        self,
+        vendor_ids: list[uuid.UUID],
+        feature_categories: list[str],
+    ) -> dict[str, Any]:
+        """Compile a feature comparison matrix across multiple vendors."""
+        ...
+
+    async def track_compliance_certifications(
+        self,
+        vendor_id: uuid.UUID,
+        certification_types: list[str],
+    ) -> dict[str, Any]:
+        """Check and track vendor compliance certifications (SOC2, ISO27001, etc.)."""
+        ...
+
+    async def score_profile_completeness(
+        self,
+        vendor_profile: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Score how complete and current a vendor profile is."""
+        ...
+
+
+@runtime_checkable
+class IVendorDashboardAggregator(Protocol):
+    """Interface for vendor performance dashboard data aggregation."""
+
+    async def compute_vendor_performance_trends(
+        self,
+        vendor_id: uuid.UUID,
+        evaluation_history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compute performance score trends over time for a vendor."""
+        ...
+
+    async def compute_cost_trends(
+        self,
+        vendor_id: uuid.UUID,
+        cost_history: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compute cost per token or per request trends over time."""
+        ...
+
+    async def compute_usage_distribution(
+        self,
+        tenant_id: uuid.UUID,
+        usage_records: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Compute vendor usage share and distribution metrics."""
+        ...
+
+    async def export_executive_dashboard(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_ids: list[uuid.UUID],
+        period_days: int,
+    ) -> dict[str, Any]:
+        """Export a complete executive dashboard payload for the vendor portfolio."""
+        ...

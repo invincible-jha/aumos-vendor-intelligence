@@ -20,10 +20,18 @@ from aumos_common.events import EventPublisher, Topics
 from aumos_common.observability import get_logger
 
 from aumos_vendor_intelligence.core.interfaces import (
+    IArbitrageDetector,
+    IBenchmarkingRunner,
+    IContractAnalyzer,
     IContractRepository,
     IEvaluationRepository,
+    IFallbackRouter,
     IInsuranceGapRepository,
     ILockInRepository,
+    IProcurementAdvisor,
+    ISLAMonitor,
+    IVendorDashboardAggregator,
+    IVendorDataEnricher,
     IVendorRepository,
 )
 from aumos_vendor_intelligence.core.models import (
@@ -1104,3 +1112,533 @@ class InsuranceCheckerService:
         )
 
         return updated_gap
+
+
+class BenchmarkingService:
+    """Orchestrate cross-vendor benchmarking runs and persist comparison reports.
+
+    Delegates low-level benchmark execution to IBenchmarkingRunner and publishes
+    results as vendor intelligence events for downstream analytics.
+    """
+
+    def __init__(
+        self,
+        benchmarking_runner: IBenchmarkingRunner,
+        vendor_repo: IVendorRepository,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            benchmarking_runner: Adapter that executes latency/quality benchmarks.
+            vendor_repo: Vendor persistence for validation.
+            event_publisher: Kafka event publisher.
+        """
+        self._runner = benchmarking_runner
+        self._vendors = vendor_repo
+        self._publisher = event_publisher
+
+    async def run_vendor_benchmark(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_ids: list[uuid.UUID],
+        prompt_payloads: list[dict[str, Any]],
+        timeout_seconds: float = 30.0,
+    ) -> dict[str, Any]:
+        """Execute a latency and quality benchmark across multiple vendors.
+
+        Validates that all vendors exist within the tenant before running the
+        benchmark. Publishes results as a ``benchmark.completed`` event.
+
+        Args:
+            tenant_id: Requesting tenant UUID.
+            vendor_ids: List of vendor UUIDs to benchmark.
+            prompt_payloads: Prompt/response pairs to send to each vendor.
+            timeout_seconds: Per-request timeout in seconds.
+
+        Returns:
+            Comparison report dict with latency, quality, and cost metrics.
+
+        Raises:
+            NotFoundError: If any vendor ID is not found for this tenant.
+            ConflictError: If fewer than 2 vendor IDs are provided.
+        """
+        if len(vendor_ids) < 2:
+            raise ConflictError(
+                message="At least 2 vendor IDs are required for benchmarking.",
+                error_code=ErrorCode.INVALID_OPERATION,
+            )
+
+        for vendor_id in vendor_ids:
+            vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
+            if vendor is None:
+                raise NotFoundError(
+                    message=f"Vendor {vendor_id} not found.",
+                    error_code=ErrorCode.NOT_FOUND,
+                )
+
+        latency_results = await self._runner.run_latency_benchmark(
+            vendor_ids=vendor_ids,
+            prompt_payloads=prompt_payloads,
+            timeout_seconds=timeout_seconds,
+        )
+
+        report = await self._runner.generate_comparison_report(
+            benchmark_results=latency_results,
+            tenant_id=tenant_id,
+        )
+
+        logger.info(
+            "Vendor benchmark completed",
+            tenant_id=str(tenant_id),
+            vendor_count=len(vendor_ids),
+            prompt_count=len(prompt_payloads),
+        )
+
+        await self._publisher.publish(
+            Topics.VENDOR_INTELLIGENCE,
+            {
+                "event_type": "benchmark.completed",
+                "tenant_id": str(tenant_id),
+                "vendor_ids": [str(v) for v in vendor_ids],
+                "prompt_count": len(prompt_payloads),
+            },
+        )
+
+        return report
+
+
+class ContractTextAnalysisService:
+    """Analyse vendor contract text for risk, SLA terms, and pricing structure.
+
+    Wraps IContractAnalyzer to provide validated contract text analysis
+    without requiring database-backed contract records.
+    """
+
+    def __init__(
+        self,
+        contract_analyzer: IContractAnalyzer,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            contract_analyzer: Adapter for contract text parsing.
+            event_publisher: Kafka event publisher.
+        """
+        self._analyzer = contract_analyzer
+        self._publisher = event_publisher
+
+    async def analyze_contract_text(
+        self,
+        tenant_id: uuid.UUID,
+        contract_text: str,
+        annual_value_usd: float | None = None,
+    ) -> dict[str, Any]:
+        """Run full contract text analysis and return combined risk report.
+
+        Args:
+            tenant_id: Requesting tenant UUID.
+            contract_text: Raw contract text to analyse.
+            annual_value_usd: Optional annual value for liability cap computation.
+
+        Returns:
+            Combined analysis dict with sla_terms, pricing_structure,
+            liability_analysis, termination_analysis, and key_terms_summary.
+
+        Raises:
+            ConflictError: If contract_text is empty.
+        """
+        if not contract_text or not contract_text.strip():
+            raise ConflictError(
+                message="Contract text must not be empty.",
+                error_code=ErrorCode.INVALID_OPERATION,
+            )
+
+        sla_terms = await self._analyzer.extract_sla_terms(contract_text)
+        pricing = await self._analyzer.parse_pricing_structure(contract_text)
+        termination = await self._analyzer.analyze_termination_clauses(contract_text)
+        liability = await self._analyzer.detect_liability_limitations(
+            contract_text, annual_value_usd
+        )
+        summary = await self._analyzer.generate_key_terms_summary(contract_text)
+
+        report = {
+            "tenant_id": str(tenant_id),
+            "sla_terms": sla_terms,
+            "pricing_structure": pricing,
+            "termination_analysis": termination,
+            "liability_analysis": liability,
+            "key_terms_summary": summary,
+        }
+
+        logger.info(
+            "Contract text analysis completed",
+            tenant_id=str(tenant_id),
+            has_liability_warning=liability.get("has_cap_warning", False),
+        )
+
+        await self._publisher.publish(
+            Topics.VENDOR_INTELLIGENCE,
+            {
+                "event_type": "contract.text_analyzed",
+                "tenant_id": str(tenant_id),
+                "has_liability_warning": liability.get("has_cap_warning", False),
+            },
+        )
+
+        return report
+
+
+class RoutingService:
+    """Manage vendor health monitoring and automatic failover routing.
+
+    Uses IFallbackRouter to select healthy vendors and ISLAMonitor to
+    track ongoing SLA compliance across the vendor portfolio.
+    """
+
+    def __init__(
+        self,
+        fallback_router: IFallbackRouter,
+        sla_monitor: ISLAMonitor,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            fallback_router: Circuit-breaker based vendor router.
+            sla_monitor: SLA compliance tracker.
+            event_publisher: Kafka event publisher.
+        """
+        self._router = fallback_router
+        self._sla_monitor = sla_monitor
+        self._publisher = event_publisher
+
+    async def select_routing_target(
+        self,
+        tenant_id: uuid.UUID,
+        excluded_vendor_ids: list[uuid.UUID] | None = None,
+    ) -> uuid.UUID | None:
+        """Select the best healthy vendor for request routing.
+
+        Args:
+            tenant_id: Requesting tenant UUID.
+            excluded_vendor_ids: Optional vendor IDs to skip.
+
+        Returns:
+            UUID of the selected vendor or None if no healthy vendors available.
+        """
+        selected = await self._router.select_vendor(
+            tenant_id=tenant_id,
+            excluded_vendor_ids=excluded_vendor_ids,
+        )
+
+        if selected is None:
+            logger.warning(
+                "No healthy vendor available for routing",
+                tenant_id=str(tenant_id),
+            )
+        else:
+            logger.debug(
+                "Vendor selected for routing",
+                tenant_id=str(tenant_id),
+                vendor_id=str(selected),
+            )
+
+        return selected
+
+    async def record_request_outcome(
+        self,
+        vendor_id: uuid.UUID,
+        success: bool,
+        latency_ms: float,
+        error_code: str | None = None,
+    ) -> None:
+        """Record a completed request outcome for health tracking.
+
+        Args:
+            vendor_id: Vendor that handled the request.
+            success: Whether the request succeeded.
+            latency_ms: Request latency in milliseconds.
+            error_code: Optional error code if the request failed.
+        """
+        from datetime import datetime, timezone
+        await self._router.record_vendor_outcome(vendor_id, success, latency_ms)
+        await self._sla_monitor.record_health_check(
+            vendor_id=vendor_id,
+            is_up=success,
+            latency_ms=latency_ms,
+            error_code=error_code,
+            checked_at=datetime.now(tz=timezone.utc),
+        )
+
+
+class ArbitrageService:
+    """Detect vendor pricing arbitrage opportunities and generate savings reports.
+
+    Coordinates IArbitrageDetector to identify cost optimisation opportunities
+    across the vendor portfolio.
+    """
+
+    def __init__(
+        self,
+        arbitrage_detector: IArbitrageDetector,
+        vendor_repo: IVendorRepository,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            arbitrage_detector: Pareto and pricing analysis adapter.
+            vendor_repo: Vendor persistence for validation.
+            event_publisher: Kafka event publisher.
+        """
+        self._detector = arbitrage_detector
+        self._vendors = vendor_repo
+        self._publisher = event_publisher
+
+    async def generate_savings_report(
+        self,
+        tenant_id: uuid.UUID,
+        current_vendor_id: uuid.UUID,
+        candidate_vendor_ids: list[uuid.UUID],
+        monthly_token_volume: int,
+    ) -> dict[str, Any]:
+        """Generate a vendor arbitrage savings report.
+
+        Args:
+            tenant_id: Requesting tenant UUID.
+            current_vendor_id: Currently used vendor UUID.
+            candidate_vendor_ids: Alternative vendor UUIDs to evaluate.
+            monthly_token_volume: Monthly token consumption estimate.
+
+        Returns:
+            Savings report with potential cost reductions and recommendations.
+
+        Raises:
+            NotFoundError: If current vendor not found.
+        """
+        vendor = await self._vendors.get_by_id(current_vendor_id, tenant_id)
+        if vendor is None:
+            raise NotFoundError(
+                message=f"Vendor {current_vendor_id} not found.",
+                error_code=ErrorCode.NOT_FOUND,
+            )
+
+        report = await self._detector.generate_savings_report(
+            tenant_id=tenant_id,
+            current_vendor_id=current_vendor_id,
+            candidate_vendors=candidate_vendor_ids,
+            monthly_token_volume=monthly_token_volume,
+        )
+
+        logger.info(
+            "Arbitrage savings report generated",
+            tenant_id=str(tenant_id),
+            current_vendor=str(current_vendor_id),
+            candidates=len(candidate_vendor_ids),
+        )
+
+        await self._publisher.publish(
+            Topics.VENDOR_INTELLIGENCE,
+            {
+                "event_type": "arbitrage.report_generated",
+                "tenant_id": str(tenant_id),
+                "current_vendor_id": str(current_vendor_id),
+                "candidate_count": len(candidate_vendor_ids),
+                "potential_savings_usd": report.get("total_potential_savings_usd", 0.0),
+            },
+        )
+
+        return report
+
+
+class ProcurementService:
+    """Provide vendor shortlisting, RFP generation, and comparison matrices.
+
+    Coordinates IProcurementAdvisor and IVendorDataEnricher to support
+    structured procurement decision workflows.
+    """
+
+    def __init__(
+        self,
+        procurement_advisor: IProcurementAdvisor,
+        data_enricher: IVendorDataEnricher,
+        vendor_repo: IVendorRepository,
+        event_publisher: EventPublisher,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            procurement_advisor: Multi-criteria scoring and RFP adapter.
+            data_enricher: Vendor profile enrichment adapter.
+            vendor_repo: Vendor persistence.
+            event_publisher: Kafka event publisher.
+        """
+        self._advisor = procurement_advisor
+        self._enricher = data_enricher
+        self._vendors = vendor_repo
+        self._publisher = event_publisher
+
+    async def run_procurement_evaluation(
+        self,
+        tenant_id: uuid.UUID,
+        requirements: dict[str, Any],
+        candidate_vendor_ids: list[uuid.UUID],
+        top_n: int = 3,
+        scoring_weights: dict[str, float] | None = None,
+    ) -> dict[str, Any]:
+        """Run a full procurement evaluation and generate a shortlist.
+
+        Args:
+            tenant_id: Requesting tenant UUID.
+            requirements: Procurement requirements dict.
+            candidate_vendor_ids: Vendor UUIDs to evaluate.
+            top_n: Number of vendors to include in the shortlist.
+            scoring_weights: Optional custom scoring weights.
+
+        Returns:
+            Dict with shortlist, comparison_matrix, and rfp_template.
+
+        Raises:
+            NotFoundError: If any vendor ID is not found.
+            ConflictError: If fewer than 2 candidates are provided.
+        """
+        if len(candidate_vendor_ids) < 2:
+            raise ConflictError(
+                message="At least 2 candidate vendors are required for procurement evaluation.",
+                error_code=ErrorCode.INVALID_OPERATION,
+            )
+
+        vendor_profiles: list[dict[str, Any]] = []
+        for vendor_id in candidate_vendor_ids:
+            vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
+            if vendor is None:
+                raise NotFoundError(
+                    message=f"Vendor {vendor_id} not found.",
+                    error_code=ErrorCode.NOT_FOUND,
+                )
+            completeness = await self._enricher.score_profile_completeness(
+                {
+                    "id": str(vendor.id),
+                    "name": vendor.name,
+                    "category": vendor.category,
+                    "overall_score": vendor.overall_score,
+                    "website_url": vendor.website_url,
+                }
+            )
+            vendor_profiles.append(
+                {
+                    "id": str(vendor.id),
+                    "name": vendor.name,
+                    "category": vendor.category,
+                    "overall_score": vendor.overall_score,
+                    "profile_completeness": completeness.get("completeness_score", 0.0),
+                }
+            )
+
+        matched = await self._advisor.match_requirements_to_vendors(
+            requirements=requirements,
+            available_vendors=vendor_profiles,
+        )
+        scored = await self._advisor.score_vendors_multi_criteria(
+            vendors=matched,
+            scoring_weights=scoring_weights,
+        )
+        shortlist = await self._advisor.generate_shortlist(
+            scored_vendors=scored,
+            top_n=top_n,
+        )
+        matrix = await self._advisor.generate_comparison_matrix(scored_vendors=scored)
+        rfp = await self._advisor.prepare_rfp_template(
+            requirements=requirements,
+            shortlisted_vendor_ids=[
+                uuid.UUID(v["id"]) for v in shortlist.get("shortlisted_vendors", [])
+            ],
+        )
+
+        result = {
+            "shortlist": shortlist,
+            "comparison_matrix": matrix,
+            "rfp_template": rfp,
+        }
+
+        logger.info(
+            "Procurement evaluation completed",
+            tenant_id=str(tenant_id),
+            candidates_evaluated=len(candidate_vendor_ids),
+            shortlist_size=len(shortlist.get("shortlisted_vendors", [])),
+        )
+
+        await self._publisher.publish(
+            Topics.VENDOR_INTELLIGENCE,
+            {
+                "event_type": "procurement.evaluation_completed",
+                "tenant_id": str(tenant_id),
+                "candidates_evaluated": len(candidate_vendor_ids),
+            },
+        )
+
+        return result
+
+
+class VendorDashboardService:
+    """Aggregate vendor intelligence data for executive dashboards.
+
+    Coordinates IVendorDashboardAggregator to compile performance trends,
+    cost trends, and usage distribution into a unified dashboard payload.
+    """
+
+    def __init__(
+        self,
+        dashboard_aggregator: IVendorDashboardAggregator,
+        vendor_repo: IVendorRepository,
+    ) -> None:
+        """Initialise with injected dependencies.
+
+        Args:
+            dashboard_aggregator: Dashboard data aggregation adapter.
+            vendor_repo: Vendor persistence for validation.
+        """
+        self._aggregator = dashboard_aggregator
+        self._vendors = vendor_repo
+
+    async def get_executive_dashboard(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_ids: list[uuid.UUID],
+        period_days: int = 30,
+    ) -> dict[str, Any]:
+        """Compile the executive vendor intelligence dashboard.
+
+        Args:
+            tenant_id: Requesting tenant UUID.
+            vendor_ids: Vendor UUIDs to include in the dashboard.
+            period_days: Lookback period in days.
+
+        Returns:
+            Complete executive dashboard payload.
+
+        Raises:
+            ConflictError: If no vendor IDs are provided.
+        """
+        if not vendor_ids:
+            raise ConflictError(
+                message="At least one vendor ID is required for the dashboard.",
+                error_code=ErrorCode.INVALID_OPERATION,
+            )
+
+        dashboard = await self._aggregator.export_executive_dashboard(
+            tenant_id=tenant_id,
+            vendor_ids=vendor_ids,
+            period_days=period_days,
+        )
+
+        logger.info(
+            "Executive vendor dashboard compiled",
+            tenant_id=str(tenant_id),
+            vendor_count=len(vendor_ids),
+            period_days=period_days,
+        )
+
+        return dashboard
