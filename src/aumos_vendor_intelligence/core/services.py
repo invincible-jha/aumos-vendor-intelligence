@@ -9,10 +9,13 @@ Key invariants enforced by services:
 - Lock-in risk levels are derived from score thresholds (configurable).
 - Liability cap warnings are triggered when cap fraction >= 0.88 (AumOS policy).
 - Insurance gaps are deduplicated by vendor + coverage_type per tenant.
+- Questionnaire tokens expire after configured due_days.
+- ISO 42001 assessments are created/updated per control per vendor.
 """
 
+import secrets
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 from aumos_common.errors import ConflictError, ErrorCode, NotFoundError
@@ -27,11 +30,16 @@ from aumos_vendor_intelligence.core.interfaces import (
     IEvaluationRepository,
     IFallbackRouter,
     IInsuranceGapRepository,
+    IIso42001Repository,
     ILockInRepository,
+    IMonitoringAlertRepository,
+    INegotiationPlaybookGenerator,
     IProcurementAdvisor,
+    IQuestionnaireRepository,
     ISLAMonitor,
     IVendorDashboardAggregator,
     IVendorDataEnricher,
+    IVendorMonitoringAdapter,
     IVendorRepository,
 )
 from aumos_vendor_intelligence.core.models import (
@@ -40,6 +48,10 @@ from aumos_vendor_intelligence.core.models import (
     LockInAssessment,
     Vendor,
     VendorEvaluation,
+    VinMonitoringAlert,
+    VinQuestionnaireSubmission,
+    VinQuestionnaireTemplate,
+    VinVendorIso42001Assessment,
 )
 
 logger = get_logger(__name__)
@@ -55,32 +67,38 @@ VALID_VENDOR_CATEGORIES: frozenset[str] = frozenset({
     "other",
 })
 
-# Valid contract types
-VALID_CONTRACT_TYPES: frozenset[str] = frozenset({
-    "msa",
-    "sow",
-    "order_form",
-    "addendum",
-    "nda",
-})
+# Evaluation criteria weights (must sum to 1.0)
+EVALUATION_WEIGHTS: dict[str, float] = {
+    "api_compatibility": 0.25,
+    "data_portability": 0.25,
+    "security_posture": 0.20,
+    "pricing_transparency": 0.15,
+    "support_quality": 0.15,
+}
 
-# AumOS policy: liability cap fraction at or above this threshold triggers a warning
-LIABILITY_CAP_WARNING_THRESHOLD: float = 0.88
+# Lock-in risk thresholds
+LOCK_IN_HIGH_THRESHOLD: float = 0.70
+LOCK_IN_MEDIUM_THRESHOLD: float = 0.40
 
-# Default required insurance coverage types per AumOS policy
-REQUIRED_COVERAGE_TYPES: frozenset[str] = frozenset({
+# Insurance coverage requirements
+REQUIRED_COVERAGE_TYPES: list[str] = [
     "cyber_liability",
     "errors_and_omissions",
     "technology_professional_liability",
-})
+]
+MINIMUM_COVERAGE_USD: int = 5_000_000
+
+# Liability cap threshold (AumOS policy)
+LIABILITY_CAP_WARNING_THRESHOLD: float = 0.88
 
 
 class VendorScorerService:
-    """Register vendors and run multi-criteria evaluation scoring.
+    """Register vendors and compute multi-criteria evaluation scores.
 
-    Computes a weighted composite score from 5 evaluation dimensions and
-    classifies the vendor into a risk level. Updates the vendor's overall_score
-    and risk_level after each evaluation run.
+    Args:
+        vendor_repo: Repository for Vendor persistence.
+        evaluation_repo: Repository for VendorEvaluation persistence.
+        event_publisher: Kafka event publisher.
     """
 
     def __init__(
@@ -88,223 +106,162 @@ class VendorScorerService:
         vendor_repo: IVendorRepository,
         evaluation_repo: IEvaluationRepository,
         event_publisher: EventPublisher,
-        weight_api_compatibility: float = 0.25,
-        weight_data_portability: float = 0.25,
-        weight_security_posture: float = 0.20,
-        weight_pricing_transparency: float = 0.15,
-        weight_support_quality: float = 0.15,
     ) -> None:
-        """Initialise with injected dependencies.
-
-        Args:
-            vendor_repo: Vendor persistence.
-            evaluation_repo: VendorEvaluation persistence.
-            event_publisher: Kafka event publisher.
-            weight_api_compatibility: Weight for API compatibility criterion.
-            weight_data_portability: Weight for data portability criterion.
-            weight_security_posture: Weight for security posture criterion.
-            weight_pricing_transparency: Weight for pricing transparency criterion.
-            weight_support_quality: Weight for support quality criterion.
-        """
-        self._vendors = vendor_repo
-        self._evaluations = evaluation_repo
-        self._publisher = event_publisher
-        self._weights = {
-            "api_compatibility": weight_api_compatibility,
-            "data_portability": weight_data_portability,
-            "security_posture": weight_security_posture,
-            "pricing_transparency": weight_pricing_transparency,
-            "support_quality": weight_support_quality,
-        }
+        self._vendor_repo = vendor_repo
+        self._evaluation_repo = evaluation_repo
+        self._event_publisher = event_publisher
 
     async def register_vendor(
         self,
         tenant_id: uuid.UUID,
         name: str,
         category: str,
-        description: str | None = None,
-        website_url: str | None = None,
-        api_compatibility: dict[str, Any] | None = None,
-        data_portability: dict[str, Any] | None = None,
-        contact_info: dict[str, Any] | None = None,
-        registered_by: uuid.UUID | None = None,
+        description: str | None,
+        website_url: str | None,
+        api_compatibility: dict[str, Any],
+        data_portability: dict[str, Any],
+        contact_info: dict[str, Any],
+        registered_by: uuid.UUID | None,
     ) -> Vendor:
-        """Register a new AI vendor for evaluation.
+        """Register a new vendor for evaluation.
 
         Args:
             tenant_id: Owning tenant UUID.
-            name: Vendor company or product name.
-            category: Vendor category classification.
-            description: Optional vendor description.
-            website_url: Optional vendor website URL.
-            api_compatibility: Optional API compatibility metadata.
-            data_portability: Optional data portability metadata.
-            contact_info: Optional vendor contact information.
-            registered_by: Optional UUID of the registering user.
+            name: Vendor name.
+            category: Vendor category from VALID_VENDOR_CATEGORIES.
+            description: Optional description.
+            website_url: Optional website URL.
+            api_compatibility: API compatibility metadata.
+            data_portability: Data portability metadata.
+            contact_info: Contact information dict.
+            registered_by: User UUID who registered the vendor.
 
         Returns:
             Newly created Vendor in under_review status.
 
         Raises:
-            ConflictError: If the vendor category is invalid.
+            ValueError: If category is not in VALID_VENDOR_CATEGORIES.
         """
         if category not in VALID_VENDOR_CATEGORIES:
-            raise ConflictError(
-                message=f"Invalid vendor category '{category}'. Valid categories: {VALID_VENDOR_CATEGORIES}",
-                error_code=ErrorCode.INVALID_OPERATION,
+            raise ValueError(
+                f"Invalid vendor category '{category}'. "
+                f"Valid values: {sorted(VALID_VENDOR_CATEGORIES)}"
             )
 
-        vendor = await self._vendors.create(
+        vendor = await self._vendor_repo.create(
             tenant_id=tenant_id,
             name=name,
             category=category,
             description=description,
             website_url=website_url,
-            api_compatibility=api_compatibility or {},
-            data_portability=data_portability or {},
-            contact_info=contact_info or {},
+            api_compatibility=api_compatibility,
+            data_portability=data_portability,
+            contact_info=contact_info,
             registered_by=registered_by,
         )
 
-        logger.info(
-            "Vendor registered",
-            tenant_id=str(tenant_id),
-            vendor_id=str(vendor.id),
-            name=name,
-            category=category,
-        )
-
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
+        await self._event_publisher.publish(
+            Topics.VENDOR_EVENTS,
             {
                 "event_type": "vendor.registered",
-                "tenant_id": str(tenant_id),
                 "vendor_id": str(vendor.id),
-                "name": name,
+                "tenant_id": str(tenant_id),
+                "vendor_name": name,
                 "category": category,
             },
         )
 
+        logger.info("vendor_registered", vendor_id=str(vendor.id), tenant_id=str(tenant_id))
         return vendor
 
-    async def get_vendor(
-        self, vendor_id: uuid.UUID, tenant_id: uuid.UUID
-    ) -> Vendor:
-        """Retrieve a vendor by ID.
-
-        Args:
-            vendor_id: Vendor UUID.
-            tenant_id: Requesting tenant.
-
-        Returns:
-            Vendor with current evaluation populated.
-
-        Raises:
-            NotFoundError: If vendor not found.
-        """
-        vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
-        if vendor is None:
-            raise NotFoundError(
-                message=f"Vendor {vendor_id} not found.",
-                error_code=ErrorCode.NOT_FOUND,
-            )
-        return vendor
-
-    async def list_vendors(
+    def _compute_weighted_score(
         self,
-        tenant_id: uuid.UUID,
-        page: int = 1,
-        page_size: int = 20,
-        category: str | None = None,
-        status: str | None = None,
-    ) -> tuple[list[Vendor], int]:
-        """List vendors for a tenant with pagination.
-
-        Args:
-            tenant_id: Requesting tenant.
-            page: 1-based page number.
-            page_size: Results per page.
-            category: Optional category filter.
-            status: Optional status filter.
-
-        Returns:
-            Tuple of (vendors, total_count).
-        """
-        return await self._vendors.list_by_tenant(
-            tenant_id=tenant_id,
-            page=page,
-            page_size=page_size,
-            category=category,
-            status=status,
-        )
-
-    async def run_evaluation(
-        self,
-        vendor_id: uuid.UUID,
-        tenant_id: uuid.UUID,
         api_compatibility_score: float,
         data_portability_score: float,
         security_posture_score: float,
         pricing_transparency_score: float,
         support_quality_score: float,
-        notes: str | None = None,
-        raw_responses: dict[str, Any] | None = None,
-        evaluator_id: uuid.UUID | None = None,
+    ) -> float:
+        """Compute weighted composite evaluation score.
+
+        Args:
+            api_compatibility_score: Score 0.0–1.0 for API compatibility.
+            data_portability_score: Score 0.0–1.0 for data portability.
+            security_posture_score: Score 0.0–1.0 for security posture.
+            pricing_transparency_score: Score 0.0–1.0 for pricing transparency.
+            support_quality_score: Score 0.0–1.0 for support quality.
+
+        Returns:
+            Weighted composite score 0.0–1.0.
+        """
+        return (
+            api_compatibility_score * EVALUATION_WEIGHTS["api_compatibility"]
+            + data_portability_score * EVALUATION_WEIGHTS["data_portability"]
+            + security_posture_score * EVALUATION_WEIGHTS["security_posture"]
+            + pricing_transparency_score * EVALUATION_WEIGHTS["pricing_transparency"]
+            + support_quality_score * EVALUATION_WEIGHTS["support_quality"]
+        )
+
+    async def evaluate_vendor(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID,
+        evaluator_id: uuid.UUID | None,
+        api_compatibility_score: float,
+        data_portability_score: float,
+        security_posture_score: float,
+        pricing_transparency_score: float,
+        support_quality_score: float,
+        notes: str | None,
+        raw_responses: dict[str, Any],
     ) -> VendorEvaluation:
         """Run a multi-criteria evaluation for a vendor.
 
-        Computes a weighted composite score, classifies risk, and updates
-        the vendor's overall_score and risk_level.
-
         Args:
-            vendor_id: Vendor UUID to evaluate.
-            tenant_id: Requesting tenant.
-            api_compatibility_score: API compatibility criterion (0.0–1.0).
-            data_portability_score: Data portability criterion (0.0–1.0).
-            security_posture_score: Security posture criterion (0.0–1.0).
-            pricing_transparency_score: Pricing transparency criterion (0.0–1.0).
-            support_quality_score: Support quality criterion (0.0–1.0).
-            notes: Optional free-form evaluation notes.
-            raw_responses: Optional raw evidence dict.
-            evaluator_id: Optional user UUID performing the evaluation.
+            tenant_id: Owning tenant UUID.
+            vendor_id: Vendor to evaluate.
+            evaluator_id: User performing the evaluation.
+            api_compatibility_score: Score 0.0–1.0.
+            data_portability_score: Score 0.0–1.0.
+            security_posture_score: Score 0.0–1.0.
+            pricing_transparency_score: Score 0.0–1.0.
+            support_quality_score: Score 0.0–1.0.
+            notes: Optional evaluation notes.
+            raw_responses: Evidence and rationale by criterion.
 
         Returns:
-            Newly created VendorEvaluation marked as current.
+            Created VendorEvaluation with computed overall_score.
 
         Raises:
-            NotFoundError: If vendor not found.
-            ConflictError: If any score is outside [0.0, 1.0].
+            NotFoundError: If vendor does not exist for tenant.
+            ValueError: If any score is outside 0.0–1.0.
         """
-        await self.get_vendor(vendor_id, tenant_id)
-
-        scores = {
-            "api_compatibility": api_compatibility_score,
-            "data_portability": data_portability_score,
-            "security_posture": security_posture_score,
-            "pricing_transparency": pricing_transparency_score,
-            "support_quality": support_quality_score,
-        }
-        for criterion, score in scores.items():
+        for name, score in [
+            ("api_compatibility_score", api_compatibility_score),
+            ("data_portability_score", data_portability_score),
+            ("security_posture_score", security_posture_score),
+            ("pricing_transparency_score", pricing_transparency_score),
+            ("support_quality_score", support_quality_score),
+        ]:
             if not 0.0 <= score <= 1.0:
-                raise ConflictError(
-                    message=f"Score for '{criterion}' must be between 0.0 and 1.0, got {score}.",
-                    error_code=ErrorCode.INVALID_OPERATION,
-                )
+                raise ValueError(f"{name} must be between 0.0 and 1.0, got {score}")
 
-        overall_score = (
-            api_compatibility_score * self._weights["api_compatibility"]
-            + data_portability_score * self._weights["data_portability"]
-            + security_posture_score * self._weights["security_posture"]
-            + pricing_transparency_score * self._weights["pricing_transparency"]
-            + support_quality_score * self._weights["support_quality"]
+        vendor = await self._vendor_repo.get_by_id(vendor_id, tenant_id)
+        if vendor is None:
+            raise NotFoundError(
+                f"Vendor {vendor_id} not found",
+                error_code=ErrorCode.NOT_FOUND,
+            )
+
+        overall_score = self._compute_weighted_score(
+            api_compatibility_score=api_compatibility_score,
+            data_portability_score=data_portability_score,
+            security_posture_score=security_posture_score,
+            pricing_transparency_score=pricing_transparency_score,
+            support_quality_score=support_quality_score,
         )
-        overall_score = round(overall_score, 4)
-        risk_level = self._classify_risk(overall_score)
 
-        # Deactivate previous evaluations
-        existing_evaluation = await self._evaluations.get_current(vendor_id, tenant_id)
-
-        evaluation = await self._evaluations.create(
+        evaluation = await self._evaluation_repo.create(
             tenant_id=tenant_id,
             vendor_id=vendor_id,
             evaluator_id=evaluator_id,
@@ -315,41 +272,78 @@ class VendorScorerService:
             support_quality_score=support_quality_score,
             overall_score=overall_score,
             notes=notes,
-            raw_responses=raw_responses or {},
+            raw_responses=raw_responses,
         )
 
-        if existing_evaluation is not None:
-            await self._evaluations.deactivate_previous(vendor_id, evaluation.id)
-
-        now = datetime.now(tz=timezone.utc)
-        await self._vendors.update_score(
-            vendor_id=vendor_id,
-            overall_score=overall_score,
-            risk_level=risk_level,
-            last_evaluated_at=now,
-        )
-
-        logger.info(
-            "Vendor evaluation completed",
-            vendor_id=str(vendor_id),
-            tenant_id=str(tenant_id),
-            overall_score=overall_score,
-            risk_level=risk_level,
-        )
-
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
+        await self._event_publisher.publish(
+            Topics.VENDOR_EVENTS,
             {
                 "event_type": "vendor.evaluated",
-                "tenant_id": str(tenant_id),
                 "vendor_id": str(vendor_id),
-                "overall_score": overall_score,
-                "risk_level": risk_level,
                 "evaluation_id": str(evaluation.id),
+                "tenant_id": str(tenant_id),
+                "overall_score": overall_score,
             },
         )
 
+        logger.info(
+            "vendor_evaluated",
+            vendor_id=str(vendor_id),
+            evaluation_id=str(evaluation.id),
+            overall_score=overall_score,
+        )
         return evaluation
+
+    async def get_vendor(
+        self, vendor_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> Vendor:
+        """Retrieve a vendor by ID.
+
+        Args:
+            vendor_id: Vendor UUID.
+            tenant_id: Tenant UUID for RLS enforcement.
+
+        Returns:
+            Vendor instance.
+
+        Raises:
+            NotFoundError: If vendor does not exist.
+        """
+        vendor = await self._vendor_repo.get_by_id(vendor_id, tenant_id)
+        if vendor is None:
+            raise NotFoundError(
+                f"Vendor {vendor_id} not found",
+                error_code=ErrorCode.NOT_FOUND,
+            )
+        return vendor
+
+    async def list_vendors(
+        self,
+        tenant_id: uuid.UUID,
+        page: int,
+        page_size: int,
+        category: str | None = None,
+        status: str | None = None,
+    ) -> list[Vendor]:
+        """List vendors for a tenant with optional filters.
+
+        Args:
+            tenant_id: Tenant UUID.
+            page: Page number (1-based).
+            page_size: Records per page.
+            category: Optional category filter.
+            status: Optional status filter.
+
+        Returns:
+            Paginated list of Vendor records.
+        """
+        return await self._vendor_repo.list_by_tenant(
+            tenant_id=tenant_id,
+            page=page,
+            page_size=page_size,
+            category=category,
+            status=status,
+        )
 
     async def compare_vendors(
         self,
@@ -359,56 +353,22 @@ class VendorScorerService:
         """Retrieve multiple vendors for side-by-side comparison.
 
         Args:
-            tenant_id: Requesting tenant.
-            vendor_ids: List of vendor UUIDs to compare (2–10 vendors).
+            tenant_id: Tenant UUID.
+            vendor_ids: List of vendor UUIDs to compare.
 
         Returns:
-            List of Vendor instances ordered by overall_score descending.
-
-        Raises:
-            ConflictError: If fewer than 2 or more than 10 vendor IDs are provided.
+            List of Vendor instances (may be shorter if some not found).
         """
-        if len(vendor_ids) < 2:
-            raise ConflictError(
-                message="At least 2 vendor IDs are required for comparison.",
-                error_code=ErrorCode.INVALID_OPERATION,
-            )
-        if len(vendor_ids) > 10:
-            raise ConflictError(
-                message="At most 10 vendors can be compared at once.",
-                error_code=ErrorCode.INVALID_OPERATION,
-            )
-
-        return await self._vendors.list_for_comparison(tenant_id, vendor_ids)
-
-    @staticmethod
-    def _classify_risk(score: float) -> str:
-        """Classify an evaluation score into a risk level.
-
-        A higher score is BETTER (less risk). Risk levels are inverted:
-        a low score = high risk, a high score = low risk.
-
-        Args:
-            score: Composite evaluation score (0.0–1.0).
-
-        Returns:
-            Risk level string: low | medium | high | critical.
-        """
-        if score >= 0.75:
-            return "low"
-        if score >= 0.50:
-            return "medium"
-        if score >= 0.25:
-            return "high"
-        return "critical"
+        return await self._vendor_repo.get_many_by_ids(vendor_ids, tenant_id)
 
 
 class LockInAssessorService:
-    """Assess vendor lock-in risk across multiple dimensions.
+    """Assess and retrieve vendor lock-in risk.
 
-    Analyses proprietary format usage, switching costs, API openness, data
-    egress capabilities, and contractual constraints to produce a composite
-    lock-in risk score and prioritised recommendations.
+    Args:
+        vendor_repo: Repository for Vendor persistence.
+        lock_in_repo: Repository for LockInAssessment persistence.
+        event_publisher: Kafka event publisher.
     """
 
     def __init__(
@@ -416,99 +376,77 @@ class LockInAssessorService:
         vendor_repo: IVendorRepository,
         lock_in_repo: ILockInRepository,
         event_publisher: EventPublisher,
-        high_risk_threshold: float = 0.70,
-        medium_risk_threshold: float = 0.40,
     ) -> None:
-        """Initialise with injected dependencies.
+        self._vendor_repo = vendor_repo
+        self._lock_in_repo = lock_in_repo
+        self._event_publisher = event_publisher
+
+    def _compute_risk_level(self, lock_in_score: float) -> str:
+        """Map composite lock-in score to risk level string.
 
         Args:
-            vendor_repo: Vendor persistence.
-            lock_in_repo: LockInAssessment persistence.
-            event_publisher: Kafka event publisher.
-            high_risk_threshold: Score at/above which risk is HIGH.
-            medium_risk_threshold: Score at/above which risk is MEDIUM.
+            lock_in_score: Composite score 0.0–1.0.
+
+        Returns:
+            Risk level: 'low' | 'medium' | 'high'.
         """
-        self._vendors = vendor_repo
-        self._lock_in = lock_in_repo
-        self._publisher = event_publisher
-        self._high_threshold = high_risk_threshold
-        self._medium_threshold = medium_risk_threshold
+        if lock_in_score >= LOCK_IN_HIGH_THRESHOLD:
+            return "high"
+        if lock_in_score >= LOCK_IN_MEDIUM_THRESHOLD:
+            return "medium"
+        return "low"
 
     async def assess_lock_in(
         self,
-        vendor_id: uuid.UUID,
         tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID,
+        assessed_by: uuid.UUID | None,
         proprietary_formats_score: float,
         switching_cost_score: float,
         api_openness_score: float,
         data_egress_score: float,
         contractual_lock_in_score: float,
-        risk_factors: list[dict[str, Any]] | None = None,
-        recommendations: list[dict[str, Any]] | None = None,
-        assessed_by: uuid.UUID | None = None,
+        risk_factors: list[dict[str, Any]],
+        recommendations: list[dict[str, Any]],
     ) -> LockInAssessment:
         """Run a lock-in risk assessment for a vendor.
 
-        Computes a weighted composite lock-in score and classifies risk level.
-        All dimension scores represent risk (0.0=no risk, 1.0=maximum risk).
-
         Args:
-            vendor_id: Vendor UUID to assess.
-            tenant_id: Requesting tenant.
-            proprietary_formats_score: Degree of proprietary format usage (0.0–1.0).
-            switching_cost_score: Relative switching cost estimate (0.0–1.0).
-            api_openness_score: API lock-in degree (0.0=open standard, 1.0=proprietary).
-            data_egress_score: Data egress difficulty (0.0=trivial, 1.0=impossible).
-            contractual_lock_in_score: Contractual lock-in degree (0.0–1.0).
-            risk_factors: Optional list of identified risk factor dicts.
-            recommendations: Optional list of recommendation dicts.
-            assessed_by: Optional user UUID triggering the assessment.
+            tenant_id: Owning tenant UUID.
+            vendor_id: Vendor to assess.
+            assessed_by: User triggering the assessment.
+            proprietary_formats_score: Proprietary format usage score 0.0–1.0.
+            switching_cost_score: Switching cost score 0.0–1.0.
+            api_openness_score: API openness score 0.0–1.0 (inverted).
+            data_egress_score: Data egress ease score 0.0–1.0 (inverted).
+            contractual_lock_in_score: Contractual lock-in score 0.0–1.0.
+            risk_factors: List of identified risk factor dicts.
+            recommendations: List of recommendation dicts.
 
         Returns:
-            Newly created LockInAssessment.
+            Created LockInAssessment with computed lock_in_score and risk_level.
 
         Raises:
-            NotFoundError: If vendor not found.
-            ConflictError: If any score is outside [0.0, 1.0].
+            NotFoundError: If vendor does not exist.
         """
-        vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
+        vendor = await self._vendor_repo.get_by_id(vendor_id, tenant_id)
         if vendor is None:
             raise NotFoundError(
-                message=f"Vendor {vendor_id} not found.",
+                f"Vendor {vendor_id} not found",
                 error_code=ErrorCode.NOT_FOUND,
             )
 
-        dimension_scores = {
-            "proprietary_formats": proprietary_formats_score,
-            "switching_cost": switching_cost_score,
-            "api_openness": api_openness_score,
-            "data_egress": data_egress_score,
-            "contractual_lock_in": contractual_lock_in_score,
-        }
-        for dimension, score in dimension_scores.items():
-            if not 0.0 <= score <= 1.0:
-                raise ConflictError(
-                    message=f"Score for '{dimension}' must be between 0.0 and 1.0, got {score}.",
-                    error_code=ErrorCode.INVALID_OPERATION,
-                )
+        lock_in_score = (
+            proprietary_formats_score
+            + switching_cost_score
+            + api_openness_score
+            + data_egress_score
+            + contractual_lock_in_score
+        ) / 5.0
 
-        # Equal-weighted composite lock-in score
-        lock_in_score = round(
-            (
-                proprietary_formats_score
-                + switching_cost_score
-                + api_openness_score
-                + data_egress_score
-                + contractual_lock_in_score
-            )
-            / 5.0,
-            4,
-        )
-        risk_level = self._classify_lock_in_risk(lock_in_score)
+        risk_level = self._compute_risk_level(lock_in_score)
 
-        existing = await self._lock_in.get_current(vendor_id, tenant_id)
-
-        assessment = await self._lock_in.create(
+        assessment = await self._lock_in_repo.create(
             tenant_id=tenant_id,
             vendor_id=vendor_id,
             assessed_by=assessed_by,
@@ -519,381 +457,247 @@ class LockInAssessorService:
             api_openness_score=api_openness_score,
             data_egress_score=data_egress_score,
             contractual_lock_in_score=contractual_lock_in_score,
-            risk_factors=risk_factors or [],
-            recommendations=recommendations or [],
+            risk_factors=risk_factors,
+            recommendations=recommendations,
         )
 
-        if existing is not None:
-            await self._lock_in.deactivate_previous(vendor_id, assessment.id)
-
-        logger.info(
-            "Lock-in assessment completed",
-            vendor_id=str(vendor_id),
-            tenant_id=str(tenant_id),
-            lock_in_score=lock_in_score,
-            risk_level=risk_level,
-        )
-
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
+        await self._event_publisher.publish(
+            Topics.VENDOR_EVENTS,
             {
                 "event_type": "vendor.lock_in_assessed",
-                "tenant_id": str(tenant_id),
                 "vendor_id": str(vendor_id),
+                "assessment_id": str(assessment.id),
+                "tenant_id": str(tenant_id),
                 "lock_in_score": lock_in_score,
                 "risk_level": risk_level,
-                "assessment_id": str(assessment.id),
             },
         )
 
+        logger.info(
+            "lock_in_assessed",
+            vendor_id=str(vendor_id),
+            lock_in_score=lock_in_score,
+            risk_level=risk_level,
+        )
         return assessment
 
-    async def get_lock_in_assessment(
+    async def get_current_assessment(
         self, vendor_id: uuid.UUID, tenant_id: uuid.UUID
-    ) -> LockInAssessment:
-        """Retrieve the current lock-in assessment for a vendor.
+    ) -> LockInAssessment | None:
+        """Retrieve the most recent lock-in assessment for a vendor.
 
         Args:
             vendor_id: Vendor UUID.
-            tenant_id: Requesting tenant.
+            tenant_id: Tenant UUID.
 
         Returns:
-            Current LockInAssessment.
-
-        Raises:
-            NotFoundError: If vendor not found or not yet assessed.
+            Current LockInAssessment or None if never assessed.
         """
-        vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
-        if vendor is None:
-            raise NotFoundError(
-                message=f"Vendor {vendor_id} not found.",
-                error_code=ErrorCode.NOT_FOUND,
-            )
-
-        assessment = await self._lock_in.get_current(vendor_id, tenant_id)
-        if assessment is None:
-            raise NotFoundError(
-                message=f"No lock-in assessment found for vendor {vendor_id}. Run an assessment first.",
-                error_code=ErrorCode.NOT_FOUND,
-            )
-        return assessment
-
-    def _classify_lock_in_risk(self, score: float) -> str:
-        """Classify a lock-in score into a risk level.
-
-        A higher score = higher lock-in risk.
-
-        Args:
-            score: Composite lock-in score (0.0–1.0).
-
-        Returns:
-            Risk level string: low | medium | high.
-        """
-        if score >= self._high_threshold:
-            return "high"
-        if score >= self._medium_threshold:
-            return "medium"
-        return "low"
+        return await self._lock_in_repo.get_current(vendor_id, tenant_id)
 
 
 class ContractAnalyzerService:
-    """Analyse vendor contract risk with focus on liability cap detection.
+    """Submit and analyse vendor contract risk.
 
-    Implements the AumOS 88% cap liability policy: contracts that limit
-    remedies to approximately 1 month of fees (fraction >= 0.88) receive
-    an explicit warning and are elevated to high/critical risk level.
+    Args:
+        vendor_repo: Repository for Vendor persistence.
+        contract_repo: Repository for Contract persistence.
+        contract_analyzer: LLM-backed contract analysis adapter.
+        event_publisher: Kafka event publisher.
     """
 
     def __init__(
         self,
         vendor_repo: IVendorRepository,
         contract_repo: IContractRepository,
+        contract_analyzer: IContractAnalyzer,
         event_publisher: EventPublisher,
-        liability_cap_warning_threshold: float = LIABILITY_CAP_WARNING_THRESHOLD,
     ) -> None:
-        """Initialise with injected dependencies.
+        self._vendor_repo = vendor_repo
+        self._contract_repo = contract_repo
+        self._contract_analyzer = contract_analyzer
+        self._event_publisher = event_publisher
+
+    def _check_liability_cap_warning(
+        self,
+        liability_cap_fraction: float | None,
+        liability_cap_months: float | None,
+    ) -> bool:
+        """Determine whether the 88% liability cap policy is triggered.
 
         Args:
-            vendor_repo: Vendor persistence.
-            contract_repo: Contract persistence.
-            event_publisher: Kafka event publisher.
-            liability_cap_warning_threshold: Fraction at which cap warning fires.
-        """
-        self._vendors = vendor_repo
-        self._contracts = contract_repo
-        self._publisher = event_publisher
-        self._cap_threshold = liability_cap_warning_threshold
+            liability_cap_fraction: Cap as fraction of annual fees.
+            liability_cap_months: Cap expressed as months of fees.
 
-    async def submit_contract(
+        Returns:
+            True if a liability cap warning should be raised.
+        """
+        if liability_cap_fraction is not None and liability_cap_fraction >= LIABILITY_CAP_WARNING_THRESHOLD:
+            return True
+        if liability_cap_months is not None and liability_cap_months <= 1.0:
+            return True
+        return False
+
+    async def analyze_contract(
         self,
         tenant_id: uuid.UUID,
         vendor_id: uuid.UUID,
+        analysed_by: uuid.UUID | None,
         contract_name: str,
         contract_type: str,
-        effective_date: datetime | None = None,
-        expiry_date: datetime | None = None,
-        annual_value_usd: int | None = None,
-        analysed_by: uuid.UUID | None = None,
+        effective_date: datetime | None,
+        expiry_date: datetime | None,
+        annual_value_usd: int | None,
+        liability_cap_months: float | None,
+        liability_cap_fraction: float | None,
+        auto_renewal_clause: bool,
+        governing_law: str | None,
+        clauses: dict[str, Any],
     ) -> Contract:
-        """Register a new contract for risk analysis.
+        """Submit a contract for risk analysis.
 
         Args:
             tenant_id: Owning tenant UUID.
-            vendor_id: Vendor UUID this contract is with.
-            contract_name: Contract title.
+            vendor_id: Associated vendor UUID.
+            analysed_by: User submitting the contract.
+            contract_name: Contract reference name.
             contract_type: msa | sow | order_form | addendum | nda.
-            effective_date: Optional contract effective date.
-            expiry_date: Optional contract expiry date.
-            annual_value_usd: Optional annual contract value in USD.
-            analysed_by: Optional user UUID submitting the contract.
+            effective_date: Optional effective date.
+            expiry_date: Optional expiry/renewal date.
+            annual_value_usd: Optional annual value in USD.
+            liability_cap_months: Liability cap in months of fees.
+            liability_cap_fraction: Liability cap as fraction of annual fees.
+            auto_renewal_clause: Whether auto-renewal clause present.
+            governing_law: Governing law jurisdiction.
+            clauses: Extracted clause text keyed by clause type.
 
         Returns:
-            Newly created Contract with no risk analysis yet.
+            Analysed Contract with risk_score, risk_level, and identified_risks.
 
         Raises:
-            NotFoundError: If vendor not found.
-            ConflictError: If contract_type is invalid.
+            NotFoundError: If vendor does not exist.
         """
-        vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
+        vendor = await self._vendor_repo.get_by_id(vendor_id, tenant_id)
         if vendor is None:
             raise NotFoundError(
-                message=f"Vendor {vendor_id} not found.",
+                f"Vendor {vendor_id} not found",
                 error_code=ErrorCode.NOT_FOUND,
             )
 
-        if contract_type not in VALID_CONTRACT_TYPES:
-            raise ConflictError(
-                message=f"Invalid contract type '{contract_type}'. Valid types: {VALID_CONTRACT_TYPES}",
-                error_code=ErrorCode.INVALID_OPERATION,
-            )
+        has_warning = self._check_liability_cap_warning(liability_cap_fraction, liability_cap_months)
 
-        contract = await self._contracts.create(
+        risk_score, risk_level, identified_risks = await self._contract_analyzer.analyze(
+            contract_name=contract_name,
+            contract_type=contract_type,
+            clauses=clauses,
+            has_liability_cap_warning=has_warning,
+            auto_renewal_clause=auto_renewal_clause,
+        )
+
+        if has_warning:
+            identified_risks = [
+                {
+                    "risk_type": "liability_cap",
+                    "severity": "high",
+                    "clause_reference": "Liability limitation clause",
+                    "description": (
+                        "Vendor liability is capped at or below 1 month of fees, "
+                        "substantially limiting remedies for data breaches or service failures."
+                    ),
+                    "recommendation": (
+                        "Negotiate a minimum 12-month liability cap or seek uncapped liability "
+                        "for data protection violations and wilful misconduct."
+                    ),
+                },
+                *identified_risks,
+            ]
+
+        contract = await self._contract_repo.create(
             tenant_id=tenant_id,
             vendor_id=vendor_id,
+            analysed_by=analysed_by,
             contract_name=contract_name,
             contract_type=contract_type,
             effective_date=effective_date,
             expiry_date=expiry_date,
             annual_value_usd=annual_value_usd,
-            analysed_by=analysed_by,
-        )
-
-        logger.info(
-            "Contract submitted for analysis",
-            tenant_id=str(tenant_id),
-            contract_id=str(contract.id),
-            vendor_id=str(vendor_id),
-            contract_type=contract_type,
-        )
-
-        return contract
-
-    async def analyze_contract(
-        self,
-        contract_id: uuid.UUID,
-        tenant_id: uuid.UUID,
-        liability_cap_months: float | None,
-        annual_value_usd: int | None,
-        auto_renewal_clause: bool,
-        governing_law: str | None,
-        clauses: dict[str, Any] | None = None,
-        additional_risks: list[dict[str, Any]] | None = None,
-    ) -> Contract:
-        """Run risk analysis on a submitted contract.
-
-        Applies the AumOS 88% cap liability policy to flag contracts where
-        vendor liability is capped at approximately 1 month of fees or less.
-
-        Args:
-            contract_id: Contract UUID.
-            tenant_id: Requesting tenant.
-            liability_cap_months: Liability cap expressed in months of fees.
-            annual_value_usd: Annual contract value in USD (used for cap computation).
-            auto_renewal_clause: True if the contract auto-renews.
-            governing_law: Governing law jurisdiction.
-            clauses: Optional extracted clause dict.
-            additional_risks: Optional list of additional risk dicts from external analysis.
-
-        Returns:
-            Updated Contract with risk analysis populated.
-
-        Raises:
-            NotFoundError: If contract not found.
-        """
-        contract = await self._contracts.get_by_id(contract_id, tenant_id)
-        if contract is None:
-            raise NotFoundError(
-                message=f"Contract {contract_id} not found.",
-                error_code=ErrorCode.NOT_FOUND,
-            )
-
-        # Compute liability cap fraction
-        liability_cap_fraction: float | None = None
-        has_liability_cap_warning = False
-
-        if liability_cap_months is not None:
-            # Convert months to fraction of annual fees
-            # 1 month = 1/12 = 0.0833... of annual
-            liability_cap_fraction = round(liability_cap_months / 12.0, 4)
-            has_liability_cap_warning = liability_cap_fraction <= (1.0 / 12.0 + 0.001)
-            # Also flag by the raw fraction threshold
-            if liability_cap_months <= 1.0:
-                has_liability_cap_warning = True
-
-        # Build risk list
-        identified_risks: list[dict[str, Any]] = list(additional_risks or [])
-
-        if has_liability_cap_warning:
-            identified_risks.insert(0, {
-                "risk_type": "liability_cap",
-                "severity": "high",
-                "clause_reference": "Liability / Indemnification Section",
-                "description": (
-                    f"Contract caps vendor liability at {liability_cap_months} month(s) of fees "
-                    f"(fraction: {liability_cap_fraction:.2%}). "
-                    "AumOS policy flags caps at or below 1 month as inadequate for enterprise AI risk."
-                ),
-                "recommendation": (
-                    "Negotiate to raise the liability cap to a minimum of 12 months of fees "
-                    "or a fixed amount (e.g., $5M), whichever is greater."
-                ),
-            })
-
-        if auto_renewal_clause:
-            identified_risks.append({
-                "risk_type": "auto_renewal",
-                "severity": "medium",
-                "clause_reference": "Term / Renewal Section",
-                "description": (
-                    "Contract auto-renews without explicit opt-out. "
-                    "Missed cancellation windows can result in unintended multi-year commitments."
-                ),
-                "recommendation": (
-                    "Add calendar reminders 90 and 30 days before each renewal date. "
-                    "Consider negotiating a longer notice window (60-90 days minimum)."
-                ),
-            })
-
-        # Compute risk score: starts at 0, increases for each identified risk
-        risk_score = self._compute_risk_score(
-            has_liability_cap_warning=has_liability_cap_warning,
-            auto_renewal_clause=auto_renewal_clause,
-            additional_risk_count=len(additional_risks or []),
-        )
-        risk_level = self._classify_contract_risk(risk_score)
-
-        now = datetime.now(tz=timezone.utc)
-        updated_contract = await self._contracts.update_risk_analysis(
-            contract_id=contract_id,
             liability_cap_months=liability_cap_months,
             liability_cap_fraction=liability_cap_fraction,
-            has_liability_cap_warning=has_liability_cap_warning,
+            has_liability_cap_warning=has_warning,
             auto_renewal_clause=auto_renewal_clause,
             governing_law=governing_law,
             risk_score=risk_score,
             risk_level=risk_level,
             identified_risks=identified_risks,
-            clauses=clauses or {},
-            analysed_at=now,
+            clauses=clauses,
         )
 
-        logger.info(
-            "Contract risk analysis completed",
-            contract_id=str(contract_id),
-            tenant_id=str(tenant_id),
-            risk_score=risk_score,
-            risk_level=risk_level,
-            has_liability_cap_warning=has_liability_cap_warning,
-        )
-
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
+        await self._event_publisher.publish(
+            Topics.VENDOR_EVENTS,
             {
                 "event_type": "contract.analyzed",
+                "contract_id": str(contract.id),
+                "vendor_id": str(vendor_id),
                 "tenant_id": str(tenant_id),
-                "contract_id": str(contract_id),
-                "vendor_id": str(contract.vendor_id),
-                "risk_score": risk_score,
                 "risk_level": risk_level,
-                "has_liability_cap_warning": has_liability_cap_warning,
-                "risk_count": len(identified_risks),
+                "has_liability_cap_warning": has_warning,
             },
         )
 
-        return updated_contract
+        logger.info(
+            "contract_analyzed",
+            contract_id=str(contract.id),
+            vendor_id=str(vendor_id),
+            risk_level=risk_level,
+            has_liability_cap_warning=has_warning,
+        )
+        return contract
 
     async def get_contract_risks(
         self, contract_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> Contract:
-        """Retrieve the contract risk report for a contract.
+        """Retrieve a contract and its risk analysis.
 
         Args:
             contract_id: Contract UUID.
-            tenant_id: Requesting tenant.
+            tenant_id: Tenant UUID.
 
         Returns:
-            Contract with risk analysis populated.
+            Contract with risk analysis.
 
         Raises:
-            NotFoundError: If contract not found.
+            NotFoundError: If contract does not exist.
         """
-        contract = await self._contracts.get_by_id(contract_id, tenant_id)
+        contract = await self._contract_repo.get_by_id(contract_id, tenant_id)
         if contract is None:
             raise NotFoundError(
-                message=f"Contract {contract_id} not found.",
+                f"Contract {contract_id} not found",
                 error_code=ErrorCode.NOT_FOUND,
             )
         return contract
 
-    @staticmethod
-    def _compute_risk_score(
-        has_liability_cap_warning: bool,
-        auto_renewal_clause: bool,
-        additional_risk_count: int,
-    ) -> float:
-        """Compute a normalised risk score for a contract.
+    async def get_latest_analysis(
+        self, vendor_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> Contract | None:
+        """Get the most recent contract analysis for a vendor.
 
         Args:
-            has_liability_cap_warning: True if liability cap is below threshold.
-            auto_renewal_clause: True if auto-renewal clause is present.
-            additional_risk_count: Number of additional risks identified.
+            vendor_id: Vendor UUID.
+            tenant_id: Tenant UUID.
 
         Returns:
-            Risk score (0.0–1.0).
+            Most recent Contract or None.
         """
-        score = 0.0
-        if has_liability_cap_warning:
-            score += 0.50  # Liability cap is the most significant risk
-        if auto_renewal_clause:
-            score += 0.20
-        # Each additional risk adds diminishing weight
-        score += min(additional_risk_count * 0.05, 0.30)
-        return round(min(score, 1.0), 4)
-
-    @staticmethod
-    def _classify_contract_risk(score: float) -> str:
-        """Classify a contract risk score into a risk level.
-
-        Args:
-            score: Contract risk score (0.0–1.0).
-
-        Returns:
-            Risk level: low | medium | high | critical.
-        """
-        if score >= 0.75:
-            return "critical"
-        if score >= 0.50:
-            return "high"
-        if score >= 0.25:
-            return "medium"
-        return "low"
+        return await self._contract_repo.get_latest_for_vendor(vendor_id, tenant_id)
 
 
 class InsuranceCheckerService:
-    """Detect insurance coverage gaps in AI vendor relationships.
+    """Check vendor insurance coverage gaps.
 
-    Compares vendor insurance documentation against AumOS minimum coverage
-    requirements. Creates gap records for deficiencies and tracks remediation.
+    Args:
+        vendor_repo: Repository for Vendor persistence.
+        insurance_gap_repo: Repository for InsuranceGap persistence.
+        event_publisher: Kafka event publisher.
     """
 
     def __init__(
@@ -901,744 +705,910 @@ class InsuranceCheckerService:
         vendor_repo: IVendorRepository,
         insurance_gap_repo: IInsuranceGapRepository,
         event_publisher: EventPublisher,
-        required_coverage_types: list[str] | None = None,
-        minimum_coverage_amount_usd: int = 5_000_000,
     ) -> None:
-        """Initialise with injected dependencies.
+        self._vendor_repo = vendor_repo
+        self._insurance_gap_repo = insurance_gap_repo
+        self._event_publisher = event_publisher
 
-        Args:
-            vendor_repo: Vendor persistence.
-            insurance_gap_repo: InsuranceGap persistence.
-            event_publisher: Kafka event publisher.
-            required_coverage_types: Coverage types required by AumOS policy.
-            minimum_coverage_amount_usd: Minimum per-incident coverage in USD.
-        """
-        self._vendors = vendor_repo
-        self._gaps = insurance_gap_repo
-        self._publisher = event_publisher
-        self._required_types = required_coverage_types or list(REQUIRED_COVERAGE_TYPES)
-        self._minimum_coverage = minimum_coverage_amount_usd
-
-    async def check_insurance(
+    async def check_coverage(
         self,
-        vendor_id: uuid.UUID,
         tenant_id: uuid.UUID,
-        coverages: list[dict[str, Any]],
-        contract_id: uuid.UUID | None = None,
-        checked_by: uuid.UUID | None = None,
+        vendor_id: uuid.UUID,
+        contract_id: uuid.UUID | None,
+        detected_by: uuid.UUID | None,
+        coverage_items: list[dict[str, Any]],
     ) -> list[InsuranceGap]:
-        """Check vendor insurance coverages and create gap records for deficiencies.
-
-        Compares provided coverage data against required types and minimum amounts.
-        Creates InsuranceGap records for each identified deficiency.
+        """Check vendor insurance coverage against AumOS requirements.
 
         Args:
-            vendor_id: Vendor UUID to check.
-            tenant_id: Requesting tenant.
-            coverages: List of coverage dicts:
-                [{\"type\": \"cyber_liability\", \"amount_usd\": 3000000, ...}]
-            contract_id: Optional related contract UUID.
-            checked_by: Optional user UUID performing the check.
+            tenant_id: Owning tenant UUID.
+            vendor_id: Vendor to check.
+            contract_id: Optional associated contract UUID.
+            detected_by: User performing the check.
+            coverage_items: List of coverage dicts with type and amount_usd.
 
         Returns:
-            List of newly created InsuranceGap records.
+            List of InsuranceGap records for identified deficiencies.
 
         Raises:
-            NotFoundError: If vendor not found.
+            NotFoundError: If vendor does not exist.
         """
-        vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
+        vendor = await self._vendor_repo.get_by_id(vendor_id, tenant_id)
         if vendor is None:
             raise NotFoundError(
-                message=f"Vendor {vendor_id} not found.",
+                f"Vendor {vendor_id} not found",
                 error_code=ErrorCode.NOT_FOUND,
             )
 
-        covered_types: dict[str, int] = {
-            cov["type"]: cov.get("amount_usd", 0)
-            for cov in coverages
-            if "type" in cov
+        provided: dict[str, int] = {
+            item["type"]: item["amount_usd"] for item in coverage_items
         }
 
-        new_gaps: list[InsuranceGap] = []
-        now = datetime.now(tz=timezone.utc)
-
-        for required_type in self._required_types:
-            actual_coverage = covered_types.get(required_type)
-
-            if actual_coverage is None:
-                # Coverage type is completely missing
-                severity = "critical"
+        gaps: list[InsuranceGap] = []
+        for coverage_type in REQUIRED_COVERAGE_TYPES:
+            actual = provided.get(coverage_type)
+            if actual is None or actual < MINIMUM_COVERAGE_USD:
+                gap_amount = (MINIMUM_COVERAGE_USD - actual) if actual is not None else None
+                severity = "critical" if actual is None else "high"
                 description = (
-                    f"Vendor has no documented {required_type.replace('_', ' ')} insurance. "
-                    f"AumOS policy requires a minimum of ${self._minimum_coverage:,} coverage."
-                )
-                gap_amount = self._minimum_coverage
-
-            elif actual_coverage < self._minimum_coverage:
-                # Coverage exists but is below minimum threshold
-                severity = "high" if actual_coverage < self._minimum_coverage * 0.5 else "medium"
-                gap_amount = self._minimum_coverage - actual_coverage
-                description = (
-                    f"Vendor {required_type.replace('_', ' ')} insurance (${actual_coverage:,}) "
-                    f"is below the required minimum (${self._minimum_coverage:,}). "
-                    f"Gap: ${gap_amount:,}."
+                    f"No {coverage_type.replace('_', ' ')} coverage documented."
+                    if actual is None
+                    else (
+                        f"{coverage_type.replace('_', ' ').title()} coverage "
+                        f"of ${actual:,} is below the required minimum of ${MINIMUM_COVERAGE_USD:,}."
+                    )
                 )
 
-            else:
-                # Coverage is adequate — no gap
-                continue
+                gap = await self._insurance_gap_repo.upsert(
+                    tenant_id=tenant_id,
+                    vendor_id=vendor_id,
+                    contract_id=contract_id,
+                    coverage_type=coverage_type,
+                    required_coverage_usd=MINIMUM_COVERAGE_USD,
+                    actual_coverage_usd=actual,
+                    gap_amount_usd=gap_amount,
+                    severity=severity,
+                    description=description,
+                    detected_by=detected_by,
+                )
+                gaps.append(gap)
 
-            gap = await self._gaps.create(
-                tenant_id=tenant_id,
-                vendor_id=vendor_id,
-                contract_id=contract_id,
-                coverage_type=required_type,
-                required_coverage_usd=self._minimum_coverage,
-                actual_coverage_usd=actual_coverage,
-                severity=severity,
-                description=description,
-                detected_by=checked_by,
-            )
-            new_gaps.append(gap)
-
-            await self._publisher.publish(
-                Topics.VENDOR_INTELLIGENCE,
-                {
-                    "event_type": "insurance.gap_detected",
-                    "tenant_id": str(tenant_id),
-                    "vendor_id": str(vendor_id),
-                    "gap_id": str(gap.id),
-                    "coverage_type": required_type,
-                    "severity": severity,
-                    "required_coverage_usd": self._minimum_coverage,
-                    "actual_coverage_usd": actual_coverage,
-                },
-            )
+                await self._event_publisher.publish(
+                    Topics.VENDOR_EVENTS,
+                    {
+                        "event_type": "insurance.gap_detected",
+                        "gap_id": str(gap.id),
+                        "vendor_id": str(vendor_id),
+                        "tenant_id": str(tenant_id),
+                        "coverage_type": coverage_type,
+                        "severity": severity,
+                    },
+                )
 
         logger.info(
-            "Insurance check completed",
+            "insurance_check_completed",
             vendor_id=str(vendor_id),
-            tenant_id=str(tenant_id),
-            gaps_found=len(new_gaps),
-            coverages_checked=len(self._required_types),
+            gaps_found=len(gaps),
         )
+        return gaps
 
-        return new_gaps
-
-    async def get_insurance_gaps(
-        self,
-        vendor_id: uuid.UUID,
-        tenant_id: uuid.UUID,
-        status: str | None = None,
+    async def get_vendor_gaps(
+        self, vendor_id: uuid.UUID, tenant_id: uuid.UUID
     ) -> list[InsuranceGap]:
-        """Retrieve all insurance gaps for a vendor.
+        """List all insurance gaps for a vendor.
 
         Args:
             vendor_id: Vendor UUID.
-            tenant_id: Requesting tenant.
-            status: Optional status filter.
+            tenant_id: Tenant UUID.
 
         Returns:
-            List of InsuranceGap instances.
-
-        Raises:
-            NotFoundError: If vendor not found.
+            List of InsuranceGap records.
         """
-        vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
-        if vendor is None:
-            raise NotFoundError(
-                message=f"Vendor {vendor_id} not found.",
-                error_code=ErrorCode.NOT_FOUND,
-            )
-
-        return await self._gaps.list_by_vendor(vendor_id, tenant_id, status)
+        return await self._insurance_gap_repo.list_by_vendor(vendor_id, tenant_id)
 
     async def update_gap_status(
         self,
         gap_id: uuid.UUID,
         tenant_id: uuid.UUID,
         status: str,
-        remediation_notes: str | None = None,
+        remediation_notes: str | None,
     ) -> InsuranceGap:
         """Update the status of an insurance gap.
 
         Args:
-            gap_id: InsuranceGap UUID.
-            tenant_id: Requesting tenant.
+            gap_id: Gap UUID.
+            tenant_id: Tenant UUID.
             status: New status: open | remediated | accepted | escalated.
-            remediation_notes: Optional notes on remediation steps.
+            remediation_notes: Optional notes on remediation action.
 
         Returns:
             Updated InsuranceGap.
 
         Raises:
-            NotFoundError: If gap not found.
+            NotFoundError: If gap does not exist.
         """
-        gap = await self._gaps.get_by_id(gap_id, tenant_id)
+        gap = await self._insurance_gap_repo.get_by_id(gap_id, tenant_id)
         if gap is None:
             raise NotFoundError(
-                message=f"Insurance gap {gap_id} not found.",
+                f"Insurance gap {gap_id} not found",
                 error_code=ErrorCode.NOT_FOUND,
             )
 
-        remediated_at: datetime | None = None
+        remediated_at = None
         if status == "remediated":
             remediated_at = datetime.now(tz=timezone.utc)
 
-        updated_gap = await self._gaps.update_status(
+        gap = await self._insurance_gap_repo.update_status(
             gap_id=gap_id,
+            tenant_id=tenant_id,
             status=status,
             remediation_notes=remediation_notes,
             remediated_at=remediated_at,
         )
 
-        logger.info(
-            "Insurance gap status updated",
-            gap_id=str(gap_id),
-            tenant_id=str(tenant_id),
-            new_status=status,
-        )
-
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
+        await self._event_publisher.publish(
+            Topics.VENDOR_EVENTS,
             {
                 "event_type": "insurance.gap_updated",
-                "tenant_id": str(tenant_id),
                 "gap_id": str(gap_id),
-                "vendor_id": str(gap.vendor_id),
-                "coverage_type": gap.coverage_type,
+                "tenant_id": str(tenant_id),
                 "new_status": status,
             },
         )
 
-        return updated_gap
+        return gap
 
 
-class BenchmarkingService:
-    """Orchestrate cross-vendor benchmarking runs and persist comparison reports.
+# ---------------------------------------------------------------------------
+# GAP-268: Vendor Security Questionnaire System
+# ---------------------------------------------------------------------------
 
-    Delegates low-level benchmark execution to IBenchmarkingRunner and publishes
-    results as vendor intelligence events for downstream analytics.
+
+class QuestionnaireService:
+    """Manages vendor security questionnaire lifecycle.
+
+    Workflow:
+    1. Admin creates questionnaire template.
+    2. Admin distributes to vendor contact via secure tokenised link.
+    3. Vendor fills out form at public endpoint (unauthenticated).
+    4. AI reviews responses and auto-populates evaluation scores.
+    5. AumOS operator reviews and confirms AI assessment.
+
+    Args:
+        questionnaire_repo: Repository for questionnaire data.
+        llm_client: HTTP client to aumos-llm-serving for AI review.
+        vendor_scorer: VendorScorerService for score population.
+        event_publisher: Kafka event publisher.
+        settings: Vendor intelligence settings.
     """
 
     def __init__(
         self,
-        benchmarking_runner: IBenchmarkingRunner,
-        vendor_repo: IVendorRepository,
+        questionnaire_repo: IQuestionnaireRepository,
+        llm_client: Any,
+        vendor_scorer: VendorScorerService,
         event_publisher: EventPublisher,
+        settings: Any,
     ) -> None:
-        """Initialise with injected dependencies.
+        self._questionnaire_repo = questionnaire_repo
+        self._llm_client = llm_client
+        self._vendor_scorer = vendor_scorer
+        self._event_publisher = event_publisher
+        self._settings = settings
 
-        Args:
-            benchmarking_runner: Adapter that executes latency/quality benchmarks.
-            vendor_repo: Vendor persistence for validation.
-            event_publisher: Kafka event publisher.
-        """
-        self._runner = benchmarking_runner
-        self._vendors = vendor_repo
-        self._publisher = event_publisher
-
-    async def run_vendor_benchmark(
+    async def create_template(
         self,
         tenant_id: uuid.UUID,
-        vendor_ids: list[uuid.UUID],
-        prompt_payloads: list[dict[str, Any]],
-        timeout_seconds: float = 30.0,
-    ) -> dict[str, Any]:
-        """Execute a latency and quality benchmark across multiple vendors.
-
-        Validates that all vendors exist within the tenant before running the
-        benchmark. Publishes results as a ``benchmark.completed`` event.
+        name: str,
+        category: str,
+        questions: list[dict[str, Any]],
+    ) -> VinQuestionnaireTemplate:
+        """Create a new questionnaire template.
 
         Args:
-            tenant_id: Requesting tenant UUID.
-            vendor_ids: List of vendor UUIDs to benchmark.
-            prompt_payloads: Prompt/response pairs to send to each vendor.
-            timeout_seconds: Per-request timeout in seconds.
+            tenant_id: Owning tenant UUID.
+            name: Template name.
+            category: security_posture | data_portability | ai_safety | custom.
+            questions: List of question definition dicts.
 
         Returns:
-            Comparison report dict with latency, quality, and cost metrics.
-
-        Raises:
-            NotFoundError: If any vendor ID is not found for this tenant.
-            ConflictError: If fewer than 2 vendor IDs are provided.
+            Newly created VinQuestionnaireTemplate.
         """
-        if len(vendor_ids) < 2:
-            raise ConflictError(
-                message="At least 2 vendor IDs are required for benchmarking.",
-                error_code=ErrorCode.INVALID_OPERATION,
-            )
-
-        for vendor_id in vendor_ids:
-            vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
-            if vendor is None:
-                raise NotFoundError(
-                    message=f"Vendor {vendor_id} not found.",
-                    error_code=ErrorCode.NOT_FOUND,
-                )
-
-        latency_results = await self._runner.run_latency_benchmark(
-            vendor_ids=vendor_ids,
-            prompt_payloads=prompt_payloads,
-            timeout_seconds=timeout_seconds,
-        )
-
-        report = await self._runner.generate_comparison_report(
-            benchmark_results=latency_results,
+        template = await self._questionnaire_repo.create_template(
             tenant_id=tenant_id,
+            name=name,
+            category=category,
+            questions=questions,
         )
-
         logger.info(
-            "Vendor benchmark completed",
+            "questionnaire_template_created",
+            template_id=str(template.id),
             tenant_id=str(tenant_id),
-            vendor_count=len(vendor_ids),
-            prompt_count=len(prompt_payloads),
         )
+        return template
 
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
-            {
-                "event_type": "benchmark.completed",
-                "tenant_id": str(tenant_id),
-                "vendor_ids": [str(v) for v in vendor_ids],
-                "prompt_count": len(prompt_payloads),
-            },
-        )
-
-        return report
-
-
-class ContractTextAnalysisService:
-    """Analyse vendor contract text for risk, SLA terms, and pricing structure.
-
-    Wraps IContractAnalyzer to provide validated contract text analysis
-    without requiring database-backed contract records.
-    """
-
-    def __init__(
-        self,
-        contract_analyzer: IContractAnalyzer,
-        event_publisher: EventPublisher,
-    ) -> None:
-        """Initialise with injected dependencies.
-
-        Args:
-            contract_analyzer: Adapter for contract text parsing.
-            event_publisher: Kafka event publisher.
-        """
-        self._analyzer = contract_analyzer
-        self._publisher = event_publisher
-
-    async def analyze_contract_text(
+    async def distribute_questionnaire(
         self,
         tenant_id: uuid.UUID,
-        contract_text: str,
-        annual_value_usd: float | None = None,
-    ) -> dict[str, Any]:
-        """Run full contract text analysis and return combined risk report.
-
-        Args:
-            tenant_id: Requesting tenant UUID.
-            contract_text: Raw contract text to analyse.
-            annual_value_usd: Optional annual value for liability cap computation.
-
-        Returns:
-            Combined analysis dict with sla_terms, pricing_structure,
-            liability_analysis, termination_analysis, and key_terms_summary.
-
-        Raises:
-            ConflictError: If contract_text is empty.
-        """
-        if not contract_text or not contract_text.strip():
-            raise ConflictError(
-                message="Contract text must not be empty.",
-                error_code=ErrorCode.INVALID_OPERATION,
-            )
-
-        sla_terms = await self._analyzer.extract_sla_terms(contract_text)
-        pricing = await self._analyzer.parse_pricing_structure(contract_text)
-        termination = await self._analyzer.analyze_termination_clauses(contract_text)
-        liability = await self._analyzer.detect_liability_limitations(
-            contract_text, annual_value_usd
-        )
-        summary = await self._analyzer.generate_key_terms_summary(contract_text)
-
-        report = {
-            "tenant_id": str(tenant_id),
-            "sla_terms": sla_terms,
-            "pricing_structure": pricing,
-            "termination_analysis": termination,
-            "liability_analysis": liability,
-            "key_terms_summary": summary,
-        }
-
-        logger.info(
-            "Contract text analysis completed",
-            tenant_id=str(tenant_id),
-            has_liability_warning=liability.get("has_cap_warning", False),
-        )
-
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
-            {
-                "event_type": "contract.text_analyzed",
-                "tenant_id": str(tenant_id),
-                "has_liability_warning": liability.get("has_cap_warning", False),
-            },
-        )
-
-        return report
-
-
-class RoutingService:
-    """Manage vendor health monitoring and automatic failover routing.
-
-    Uses IFallbackRouter to select healthy vendors and ISLAMonitor to
-    track ongoing SLA compliance across the vendor portfolio.
-    """
-
-    def __init__(
-        self,
-        fallback_router: IFallbackRouter,
-        sla_monitor: ISLAMonitor,
-        event_publisher: EventPublisher,
-    ) -> None:
-        """Initialise with injected dependencies.
-
-        Args:
-            fallback_router: Circuit-breaker based vendor router.
-            sla_monitor: SLA compliance tracker.
-            event_publisher: Kafka event publisher.
-        """
-        self._router = fallback_router
-        self._sla_monitor = sla_monitor
-        self._publisher = event_publisher
-
-    async def select_routing_target(
-        self,
-        tenant_id: uuid.UUID,
-        excluded_vendor_ids: list[uuid.UUID] | None = None,
-    ) -> uuid.UUID | None:
-        """Select the best healthy vendor for request routing.
-
-        Args:
-            tenant_id: Requesting tenant UUID.
-            excluded_vendor_ids: Optional vendor IDs to skip.
-
-        Returns:
-            UUID of the selected vendor or None if no healthy vendors available.
-        """
-        selected = await self._router.select_vendor(
-            tenant_id=tenant_id,
-            excluded_vendor_ids=excluded_vendor_ids,
-        )
-
-        if selected is None:
-            logger.warning(
-                "No healthy vendor available for routing",
-                tenant_id=str(tenant_id),
-            )
-        else:
-            logger.debug(
-                "Vendor selected for routing",
-                tenant_id=str(tenant_id),
-                vendor_id=str(selected),
-            )
-
-        return selected
-
-    async def record_request_outcome(
-        self,
         vendor_id: uuid.UUID,
-        success: bool,
-        latency_ms: float,
-        error_code: str | None = None,
-    ) -> None:
-        """Record a completed request outcome for health tracking.
+        template_id: uuid.UUID,
+        vendor_contact_email: str,
+        due_days: int,
+    ) -> VinQuestionnaireSubmission:
+        """Create a submission and send secure tokenised link to vendor.
 
         Args:
-            vendor_id: Vendor that handled the request.
-            success: Whether the request succeeded.
-            latency_ms: Request latency in milliseconds.
-            error_code: Optional error code if the request failed.
-        """
-        from datetime import datetime, timezone
-        await self._router.record_vendor_outcome(vendor_id, success, latency_ms)
-        await self._sla_monitor.record_health_check(
-            vendor_id=vendor_id,
-            is_up=success,
-            latency_ms=latency_ms,
-            error_code=error_code,
-            checked_at=datetime.now(tz=timezone.utc),
-        )
-
-
-class ArbitrageService:
-    """Detect vendor pricing arbitrage opportunities and generate savings reports.
-
-    Coordinates IArbitrageDetector to identify cost optimisation opportunities
-    across the vendor portfolio.
-    """
-
-    def __init__(
-        self,
-        arbitrage_detector: IArbitrageDetector,
-        vendor_repo: IVendorRepository,
-        event_publisher: EventPublisher,
-    ) -> None:
-        """Initialise with injected dependencies.
-
-        Args:
-            arbitrage_detector: Pareto and pricing analysis adapter.
-            vendor_repo: Vendor persistence for validation.
-            event_publisher: Kafka event publisher.
-        """
-        self._detector = arbitrage_detector
-        self._vendors = vendor_repo
-        self._publisher = event_publisher
-
-    async def generate_savings_report(
-        self,
-        tenant_id: uuid.UUID,
-        current_vendor_id: uuid.UUID,
-        candidate_vendor_ids: list[uuid.UUID],
-        monthly_token_volume: int,
-    ) -> dict[str, Any]:
-        """Generate a vendor arbitrage savings report.
-
-        Args:
-            tenant_id: Requesting tenant UUID.
-            current_vendor_id: Currently used vendor UUID.
-            candidate_vendor_ids: Alternative vendor UUIDs to evaluate.
-            monthly_token_volume: Monthly token consumption estimate.
+            tenant_id: Owning tenant UUID.
+            vendor_id: Vendor receiving the questionnaire.
+            template_id: Template to use for this submission.
+            vendor_contact_email: Recipient email address.
+            due_days: Number of days from now until response is due.
 
         Returns:
-            Savings report with potential cost reductions and recommendations.
+            Created VinQuestionnaireSubmission in 'sent' status.
+        """
+        token = secrets.token_urlsafe(48)
+        due_at = datetime.now(tz=timezone.utc) + timedelta(days=due_days)
+
+        submission = await self._questionnaire_repo.create_submission(
+            tenant_id=tenant_id,
+            vendor_id=vendor_id,
+            template_id=template_id,
+            vendor_contact_email=vendor_contact_email,
+            sent_at=datetime.now(tz=timezone.utc),
+            due_at=due_at,
+            token=token,
+        )
+
+        await self._event_publisher.publish(
+            Topics.VENDOR_EVENTS,
+            {
+                "event_type": "vendor.questionnaire_sent",
+                "submission_id": str(submission.id),
+                "vendor_id": str(vendor_id),
+                "tenant_id": str(tenant_id),
+                "vendor_contact_email": vendor_contact_email,
+            },
+        )
+
+        logger.info(
+            "questionnaire_distributed",
+            submission_id=str(submission.id),
+            vendor_id=str(vendor_id),
+        )
+        return submission
+
+    async def submit_vendor_responses(
+        self,
+        token: str,
+        responses: dict[str, Any],
+    ) -> VinQuestionnaireSubmission:
+        """Record vendor responses submitted via the public tokenised link.
+
+        Args:
+            token: URL-safe token from the questionnaire link.
+            responses: Vendor answers keyed by question ID.
+
+        Returns:
+            Updated VinQuestionnaireSubmission in 'completed' status.
 
         Raises:
-            NotFoundError: If current vendor not found.
+            NotFoundError: If token is invalid.
+            ValueError: If token has expired or already been used.
         """
-        vendor = await self._vendors.get_by_id(current_vendor_id, tenant_id)
-        if vendor is None:
+        link = await self._questionnaire_repo.get_link_by_token(token)
+        if link is None:
             raise NotFoundError(
-                message=f"Vendor {current_vendor_id} not found.",
+                "Questionnaire link not found or invalid",
                 error_code=ErrorCode.NOT_FOUND,
             )
 
-        report = await self._detector.generate_savings_report(
+        now = datetime.now(tz=timezone.utc)
+        if link.expires_at < now:
+            raise ValueError("Questionnaire link has expired")
+        if link.used:
+            raise ValueError("Questionnaire link has already been used")
+
+        submission = await self._questionnaire_repo.record_responses(
+            submission_id=link.submission_id,
+            responses=responses,
+            completed_at=now,
+        )
+        await self._questionnaire_repo.mark_link_used(link.id)
+
+        logger.info(
+            "questionnaire_responses_submitted",
+            submission_id=str(link.submission_id),
+        )
+        return submission
+
+    async def ai_review_responses(
+        self,
+        submission_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+    ) -> dict[str, float]:
+        """Use LLM to review vendor responses and generate evaluation scores.
+
+        Args:
+            submission_id: Submission UUID to review.
+            tenant_id: Tenant UUID.
+
+        Returns:
+            Scores by criterion category (0.0–1.0 each).
+
+        Raises:
+            NotFoundError: If submission does not exist.
+        """
+        submission = await self._questionnaire_repo.get_submission(submission_id, tenant_id)
+        if submission is None:
+            raise NotFoundError(
+                f"Questionnaire submission {submission_id} not found",
+                error_code=ErrorCode.NOT_FOUND,
+            )
+
+        template = await self._questionnaire_repo.get_template(submission.template_id, tenant_id)
+        if template is None:
+            raise NotFoundError(
+                f"Questionnaire template {submission.template_id} not found",
+                error_code=ErrorCode.NOT_FOUND,
+            )
+
+        # Build prompt with questions and vendor responses for LLM scoring
+        question_map = {q["id"]: q for q in template.questions}
+        category_scores: dict[str, list[float]] = {}
+
+        for question_id, answer in submission.vendor_responses.items():
+            question = question_map.get(question_id)
+            if question is None:
+                continue
+
+            category = question.get("category", "general")
+            weight = question.get("weight", 0.1)
+
+            # LLM-as-judge: score each question response
+            try:
+                response = await self._llm_client.post(
+                    "/api/v1/completions",
+                    json={
+                        "prompt": (
+                            f"You are a security assessment expert. Score the following vendor "
+                            f"response on a scale of 0.0 to 1.0 where 1.0 is fully compliant.\n\n"
+                            f"Question: {question['text']}\n"
+                            f"Expected evidence: {question.get('expected_evidence', 'N/A')}\n"
+                            f"Vendor response: {answer}\n\n"
+                            f"Respond with only a JSON object: {{\"score\": <0.0-1.0>}}"
+                        ),
+                        "max_tokens": 50,
+                    },
+                )
+                score_data = response.json()
+                score = float(score_data.get("score", 0.5))
+            except Exception:
+                score = 0.5  # Default to middle score on LLM failure
+
+            if category not in category_scores:
+                category_scores[category] = []
+            category_scores[category].append(score * weight)
+
+        # Aggregate scores by category
+        aggregated: dict[str, float] = {
+            cat: min(1.0, sum(scores) / max(len(scores), 1))
+            for cat, scores in category_scores.items()
+        }
+
+        await self._questionnaire_repo.update_ai_review_scores(
+            submission_id=submission_id,
             tenant_id=tenant_id,
-            current_vendor_id=current_vendor_id,
-            candidate_vendors=candidate_vendor_ids,
-            monthly_token_volume=monthly_token_volume,
+            scores=aggregated,
         )
 
         logger.info(
-            "Arbitrage savings report generated",
+            "ai_review_completed",
+            submission_id=str(submission_id),
+            categories=list(aggregated.keys()),
+        )
+        return aggregated
+
+
+# ---------------------------------------------------------------------------
+# GAP-269: Continuous Vendor Monitoring
+# ---------------------------------------------------------------------------
+
+
+class VendorMonitoringService:
+    """Polls external intelligence feeds to detect vendor risk changes.
+
+    Runs periodic monitoring cycles checking breach databases, SOC2 expiry,
+    and regulatory action feeds for all active vendors.
+
+    Args:
+        vendor_repo: Repository for listing active vendors.
+        monitoring_repo: Repository for VinMonitoringAlert persistence.
+        monitoring_adapters: List of intelligence feed adapters.
+        event_publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        vendor_repo: IVendorRepository,
+        monitoring_repo: IMonitoringAlertRepository,
+        monitoring_adapters: list[IVendorMonitoringAdapter],
+        event_publisher: EventPublisher,
+    ) -> None:
+        self._vendor_repo = vendor_repo
+        self._monitoring_repo = monitoring_repo
+        self._monitoring_adapters = monitoring_adapters
+        self._event_publisher = event_publisher
+
+    async def run_monitoring_cycle(
+        self,
+        tenant_id: uuid.UUID,
+    ) -> list[VinMonitoringAlert]:
+        """Run one full monitoring cycle for all active vendors.
+
+        Args:
+            tenant_id: Tenant UUID to monitor vendors for.
+
+        Returns:
+            List of newly detected VinMonitoringAlert records.
+        """
+        vendors = await self._vendor_repo.list_active_vendors(tenant_id)
+        alerts: list[VinMonitoringAlert] = []
+
+        for vendor in vendors:
+            for adapter in self._monitoring_adapters:
+                try:
+                    detected = await adapter.check_vendor(vendor)
+                    for alert_data in detected:
+                        alert = await self._monitoring_repo.create_alert(
+                            tenant_id=tenant_id,
+                            vendor_id=vendor.id,
+                            alert_type=alert_data["alert_type"],
+                            severity=alert_data["severity"],
+                            source=alert_data["source"],
+                            description=alert_data["description"],
+                            recommended_action=alert_data.get("recommended_action"),
+                        )
+                        alerts.append(alert)
+
+                        await self._event_publisher.publish(
+                            Topics.VENDOR_EVENTS,
+                            {
+                                "event_type": "vendor.monitoring_alert",
+                                "alert_id": str(alert.id),
+                                "vendor_id": str(vendor.id),
+                                "tenant_id": str(tenant_id),
+                                "alert_type": alert_data["alert_type"],
+                                "severity": alert_data["severity"],
+                            },
+                        )
+                except Exception as exc:
+                    logger.warning(
+                        "monitoring_adapter_error",
+                        vendor_id=str(vendor.id),
+                        adapter=type(adapter).__name__,
+                        error=str(exc),
+                    )
+
+        logger.info(
+            "monitoring_cycle_complete",
             tenant_id=str(tenant_id),
-            current_vendor=str(current_vendor_id),
-            candidates=len(candidate_vendor_ids),
+            vendors_checked=len(vendors),
+            alerts_raised=len(alerts),
+        )
+        return alerts
+
+    async def list_alerts(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID | None = None,
+        resolved: bool | None = None,
+    ) -> list[VinMonitoringAlert]:
+        """List monitoring alerts for a tenant.
+
+        Args:
+            tenant_id: Tenant UUID.
+            vendor_id: Optional vendor filter.
+            resolved: Optional filter by resolved status.
+
+        Returns:
+            List of VinMonitoringAlert records.
+        """
+        return await self._monitoring_repo.list_alerts(
+            tenant_id=tenant_id,
+            vendor_id=vendor_id,
+            resolved=resolved,
         )
 
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
+
+# ---------------------------------------------------------------------------
+# GAP-270: ISO 42001 Compliance Mapping
+# ---------------------------------------------------------------------------
+
+
+class Iso42001ComplianceService:
+    """Maps vendor questionnaire evidence to ISO 42001 Annex A controls.
+
+    Generates per-vendor compliance assessments against the ISO/IEC 42001:2023
+    AI Management System standard.
+
+    Args:
+        iso_repo: Repository for ISO 42001 controls and assessments.
+        questionnaire_repo: Repository for questionnaire submissions.
+        event_publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        iso_repo: IIso42001Repository,
+        questionnaire_repo: IQuestionnaireRepository,
+        event_publisher: EventPublisher,
+    ) -> None:
+        self._iso_repo = iso_repo
+        self._questionnaire_repo = questionnaire_repo
+        self._event_publisher = event_publisher
+
+    async def assess_vendor(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID,
+        questionnaire_submission_id: uuid.UUID | None,
+        manual_assessments: list[dict[str, Any]] | None,
+    ) -> list[VinVendorIso42001Assessment]:
+        """Run or update ISO 42001 compliance assessment for a vendor.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            vendor_id: Vendor to assess.
+            questionnaire_submission_id: Optional questionnaire to derive evidence from.
+            manual_assessments: Optional list of manually provided assessment dicts.
+
+        Returns:
+            List of VinVendorIso42001Assessment records (one per control).
+        """
+        controls = await self._iso_repo.list_all_controls()
+        assessments: list[VinVendorIso42001Assessment] = []
+
+        # Derive evidence from questionnaire if provided
+        evidence_map: dict[str, str] = {}
+        if questionnaire_submission_id is not None:
+            submission = await self._questionnaire_repo.get_submission(
+                questionnaire_submission_id, tenant_id
+            )
+            if submission and submission.vendor_responses:
+                for qid, answer in submission.vendor_responses.items():
+                    evidence_map[qid] = str(answer)
+
+        # Build manual assessment lookup
+        manual_map: dict[str, dict[str, Any]] = {}
+        if manual_assessments:
+            for item in manual_assessments:
+                manual_map[item["control_id"]] = item
+
+        for control in controls:
+            manual = manual_map.get(control.id)
+            if manual:
+                compliance_status = manual["compliance_status"]
+                evidence = manual.get("evidence")
+            elif evidence_map:
+                # Default to partially_compliant when questionnaire evidence exists
+                compliance_status = "partially_compliant"
+                evidence = "; ".join(list(evidence_map.values())[:3])
+            else:
+                compliance_status = "non_compliant"
+                evidence = None
+
+            assessment = await self._iso_repo.upsert_vendor_assessment(
+                tenant_id=tenant_id,
+                vendor_id=vendor_id,
+                control_id=control.id,
+                compliance_status=compliance_status,
+                evidence=evidence,
+                assessed_from_questionnaire_id=questionnaire_submission_id,
+            )
+            assessments.append(assessment)
+
+        await self._event_publisher.publish(
+            Topics.VENDOR_EVENTS,
             {
-                "event_type": "arbitrage.report_generated",
+                "event_type": "vendor.iso42001_assessed",
+                "vendor_id": str(vendor_id),
                 "tenant_id": str(tenant_id),
-                "current_vendor_id": str(current_vendor_id),
-                "candidate_count": len(candidate_vendor_ids),
-                "potential_savings_usd": report.get("total_potential_savings_usd", 0.0),
+                "controls_assessed": len(assessments),
             },
         )
 
-        return report
+        logger.info(
+            "iso42001_assessment_complete",
+            vendor_id=str(vendor_id),
+            controls_assessed=len(assessments),
+        )
+        return assessments
+
+    async def get_compliance_report(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Generate an ISO 42001 compliance report for a vendor.
+
+        Args:
+            tenant_id: Tenant UUID.
+            vendor_id: Vendor UUID.
+
+        Returns:
+            Compliance report dict with summary statistics and per-control status.
+        """
+        assessments = await self._iso_repo.list_vendor_assessments(vendor_id, tenant_id)
+        controls = {c.id: c for c in await self._iso_repo.list_all_controls()}
+
+        status_counts: dict[str, int] = {
+            "compliant": 0,
+            "partially_compliant": 0,
+            "non_compliant": 0,
+            "not_applicable": 0,
+        }
+        for assessment in assessments:
+            status_counts[assessment.compliance_status] = (
+                status_counts.get(assessment.compliance_status, 0) + 1
+            )
+
+        total = len(assessments)
+        compliant_count = status_counts["compliant"]
+        compliance_percentage = (compliant_count / total * 100) if total > 0 else 0.0
+
+        return {
+            "vendor_id": str(vendor_id),
+            "total_controls": total,
+            "compliance_percentage": round(compliance_percentage, 1),
+            "status_summary": status_counts,
+            "assessments": [
+                {
+                    "control_id": a.control_id,
+                    "section": controls[a.control_id].section if a.control_id in controls else "",
+                    "title": controls[a.control_id].title if a.control_id in controls else "",
+                    "compliance_status": a.compliance_status,
+                    "evidence": a.evidence,
+                }
+                for a in assessments
+            ],
+        }
+
+    async def list_controls(self) -> list[Any]:
+        """List all ISO 42001 Annex A controls.
+
+        Returns:
+            List of VinIso42001Control records.
+        """
+        return await self._iso_repo.list_all_controls()
 
 
-class ProcurementService:
-    """Provide vendor shortlisting, RFP generation, and comparison matrices.
+# ---------------------------------------------------------------------------
+# GAP-271: Negotiation Playbook Generator
+# ---------------------------------------------------------------------------
 
-    Coordinates IProcurementAdvisor and IVendorDataEnricher to support
-    structured procurement decision workflows.
+
+class NegotiationPlaybookService:
+    """Generates negotiation playbooks from vendor evaluation data.
+
+    Combines evaluation scores, lock-in assessment, and contract analysis
+    to identify leverage points, red lines, recommended asks, and walk-away triggers.
+
+    Args:
+        vendor_scorer: Service for retrieving current evaluations.
+        lock_in_assessor: Service for retrieving lock-in assessments.
+        contract_analyzer: Service for retrieving contract analyses.
+        playbook_generator: Adapter for playbook content generation.
+        event_publisher: Kafka event publisher.
+    """
+
+    def __init__(
+        self,
+        vendor_scorer: VendorScorerService,
+        lock_in_assessor: LockInAssessorService,
+        contract_analyzer: ContractAnalyzerService,
+        playbook_generator: INegotiationPlaybookGenerator,
+        event_publisher: EventPublisher,
+    ) -> None:
+        self._vendor_scorer = vendor_scorer
+        self._lock_in_assessor = lock_in_assessor
+        self._contract_analyzer = contract_analyzer
+        self._playbook_generator = playbook_generator
+        self._event_publisher = event_publisher
+
+    async def generate_playbook(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID,
+    ) -> dict[str, Any]:
+        """Generate a negotiation playbook for a vendor.
+
+        Playbook sections:
+        1. Leverage points — where the buyer has negotiating leverage.
+        2. Red lines — terms that must be improved before signing.
+        3. Recommended asks — specific contract language changes.
+        4. Walk-away triggers — conditions that should kill the deal.
+
+        Args:
+            tenant_id: Tenant UUID.
+            vendor_id: Vendor UUID.
+
+        Returns:
+            Negotiation playbook dict with all four sections.
+
+        Raises:
+            NotFoundError: If vendor does not exist.
+        """
+        vendor = await self._vendor_scorer.get_vendor(vendor_id, tenant_id)
+        lock_in = await self._lock_in_assessor.get_current_assessment(vendor_id, tenant_id)
+        contract = await self._contract_analyzer.get_latest_analysis(vendor_id, tenant_id)
+
+        playbook = await self._playbook_generator.generate(
+            vendor=vendor,
+            lock_in_assessment=lock_in,
+            latest_contract=contract,
+        )
+
+        await self._event_publisher.publish(
+            Topics.VENDOR_EVENTS,
+            {
+                "event_type": "vendor.negotiation_playbook_generated",
+                "vendor_id": str(vendor_id),
+                "tenant_id": str(tenant_id),
+            },
+        )
+
+        logger.info(
+            "negotiation_playbook_generated",
+            vendor_id=str(vendor_id),
+            tenant_id=str(tenant_id),
+        )
+        return playbook
+
+
+# ---------------------------------------------------------------------------
+# GAP-272: SaaS Spend Integration
+# ---------------------------------------------------------------------------
+
+
+class SaasSpendService:
+    """Integrates with procurement systems to pull actual SaaS spend data.
+
+    Enriches vendor evaluations with real cost information from Zylo
+    or Vendr procurement APIs.
+
+    Args:
+        procurement_advisor: Adapter for procurement system integration.
+        vendor_repo: Repository for Vendor persistence.
+        event_publisher: Kafka event publisher.
     """
 
     def __init__(
         self,
         procurement_advisor: IProcurementAdvisor,
-        data_enricher: IVendorDataEnricher,
         vendor_repo: IVendorRepository,
         event_publisher: EventPublisher,
     ) -> None:
-        """Initialise with injected dependencies.
+        self._procurement_advisor = procurement_advisor
+        self._vendor_repo = vendor_repo
+        self._event_publisher = event_publisher
 
-        Args:
-            procurement_advisor: Multi-criteria scoring and RFP adapter.
-            data_enricher: Vendor profile enrichment adapter.
-            vendor_repo: Vendor persistence.
-            event_publisher: Kafka event publisher.
-        """
-        self._advisor = procurement_advisor
-        self._enricher = data_enricher
-        self._vendors = vendor_repo
-        self._publisher = event_publisher
-
-    async def run_procurement_evaluation(
+    async def sync_spend_data(
         self,
         tenant_id: uuid.UUID,
-        requirements: dict[str, Any],
-        candidate_vendor_ids: list[uuid.UUID],
-        top_n: int = 3,
-        scoring_weights: dict[str, float] | None = None,
+        vendor_id: uuid.UUID,
     ) -> dict[str, Any]:
-        """Run a full procurement evaluation and generate a shortlist.
+        """Sync SaaS spend data for a vendor from procurement system.
 
         Args:
-            tenant_id: Requesting tenant UUID.
-            requirements: Procurement requirements dict.
-            candidate_vendor_ids: Vendor UUIDs to evaluate.
-            top_n: Number of vendors to include in the shortlist.
-            scoring_weights: Optional custom scoring weights.
+            tenant_id: Tenant UUID.
+            vendor_id: Vendor UUID.
 
         Returns:
-            Dict with shortlist, comparison_matrix, and rfp_template.
+            Spend summary dict with annual_spend_usd and contract_details.
 
         Raises:
-            NotFoundError: If any vendor ID is not found.
-            ConflictError: If fewer than 2 candidates are provided.
+            NotFoundError: If vendor does not exist.
         """
-        if len(candidate_vendor_ids) < 2:
-            raise ConflictError(
-                message="At least 2 candidate vendors are required for procurement evaluation.",
-                error_code=ErrorCode.INVALID_OPERATION,
+        vendor = await self._vendor_repo.get_by_id(vendor_id, tenant_id)
+        if vendor is None:
+            raise NotFoundError(
+                f"Vendor {vendor_id} not found",
+                error_code=ErrorCode.NOT_FOUND,
             )
 
-        vendor_profiles: list[dict[str, Any]] = []
-        for vendor_id in candidate_vendor_ids:
-            vendor = await self._vendors.get_by_id(vendor_id, tenant_id)
-            if vendor is None:
-                raise NotFoundError(
-                    message=f"Vendor {vendor_id} not found.",
-                    error_code=ErrorCode.NOT_FOUND,
-                )
-            completeness = await self._enricher.score_profile_completeness(
-                {
-                    "id": str(vendor.id),
-                    "name": vendor.name,
-                    "category": vendor.category,
-                    "overall_score": vendor.overall_score,
-                    "website_url": vendor.website_url,
-                }
-            )
-            vendor_profiles.append(
-                {
-                    "id": str(vendor.id),
-                    "name": vendor.name,
-                    "category": vendor.category,
-                    "overall_score": vendor.overall_score,
-                    "profile_completeness": completeness.get("completeness_score", 0.0),
-                }
-            )
-
-        matched = await self._advisor.match_requirements_to_vendors(
-            requirements=requirements,
-            available_vendors=vendor_profiles,
+        spend_data = await self._procurement_advisor.get_vendor_spend(
+            vendor_name=vendor.name,
+            tenant_id=tenant_id,
         )
-        scored = await self._advisor.score_vendors_multi_criteria(
-            vendors=matched,
-            scoring_weights=scoring_weights,
-        )
-        shortlist = await self._advisor.generate_shortlist(
-            scored_vendors=scored,
-            top_n=top_n,
-        )
-        matrix = await self._advisor.generate_comparison_matrix(scored_vendors=scored)
-        rfp = await self._advisor.prepare_rfp_template(
-            requirements=requirements,
-            shortlisted_vendor_ids=[
-                uuid.UUID(v["id"]) for v in shortlist.get("shortlisted_vendors", [])
-            ],
-        )
-
-        result = {
-            "shortlist": shortlist,
-            "comparison_matrix": matrix,
-            "rfp_template": rfp,
-        }
 
         logger.info(
-            "Procurement evaluation completed",
+            "saas_spend_synced",
+            vendor_id=str(vendor_id),
             tenant_id=str(tenant_id),
-            candidates_evaluated=len(candidate_vendor_ids),
-            shortlist_size=len(shortlist.get("shortlisted_vendors", [])),
         )
-
-        await self._publisher.publish(
-            Topics.VENDOR_INTELLIGENCE,
-            {
-                "event_type": "procurement.evaluation_completed",
-                "tenant_id": str(tenant_id),
-                "candidates_evaluated": len(candidate_vendor_ids),
-            },
-        )
-
-        return result
+        return spend_data
 
 
-class VendorDashboardService:
-    """Aggregate vendor intelligence data for executive dashboards.
+# ---------------------------------------------------------------------------
+# GAP-273: Vendor Intelligence Feeds
+# ---------------------------------------------------------------------------
 
-    Coordinates IVendorDashboardAggregator to compile performance trends,
-    cost trends, and usage distribution into a unified dashboard payload.
+
+class VendorIntelligenceFeedService:
+    """Ingests external vendor intelligence into the vendor database.
+
+    Sources: breach disclosures, SOC2 report updates, regulatory sanctions.
+
+    Args:
+        vendor_repo: Repository for Vendor persistence.
+        monitoring_repo: Repository for VinMonitoringAlert persistence.
+        vendor_data_enricher: Adapter for vendor data enrichment.
+        event_publisher: Kafka event publisher.
     """
 
     def __init__(
         self,
-        dashboard_aggregator: IVendorDashboardAggregator,
         vendor_repo: IVendorRepository,
+        monitoring_repo: IMonitoringAlertRepository,
+        vendor_data_enricher: IVendorDataEnricher,
+        event_publisher: EventPublisher,
     ) -> None:
-        """Initialise with injected dependencies.
+        self._vendor_repo = vendor_repo
+        self._monitoring_repo = monitoring_repo
+        self._vendor_data_enricher = vendor_data_enricher
+        self._event_publisher = event_publisher
 
-        Args:
-            dashboard_aggregator: Dashboard data aggregation adapter.
-            vendor_repo: Vendor persistence for validation.
-        """
-        self._aggregator = dashboard_aggregator
-        self._vendors = vendor_repo
-
-    async def get_executive_dashboard(
+    async def ingest_intelligence_feed(
         self,
         tenant_id: uuid.UUID,
-        vendor_ids: list[uuid.UUID],
-        period_days: int = 30,
-    ) -> dict[str, Any]:
-        """Compile the executive vendor intelligence dashboard.
+        feed_type: str,
+        feed_data: list[dict[str, Any]],
+    ) -> list[VinMonitoringAlert]:
+        """Ingest a batch of intelligence feed entries.
 
         Args:
-            tenant_id: Requesting tenant UUID.
-            vendor_ids: Vendor UUIDs to include in the dashboard.
-            period_days: Lookback period in days.
+            tenant_id: Tenant UUID.
+            feed_type: Feed type identifier (e.g. 'breach_disclosure', 'soc2_update').
+            feed_data: List of feed entry dicts with vendor identifiers and details.
 
         Returns:
-            Complete executive dashboard payload.
-
-        Raises:
-            ConflictError: If no vendor IDs are provided.
+            List of newly created VinMonitoringAlert records.
         """
-        if not vendor_ids:
-            raise ConflictError(
-                message="At least one vendor ID is required for the dashboard.",
-                error_code=ErrorCode.INVALID_OPERATION,
-            )
+        alerts: list[VinMonitoringAlert] = []
 
-        dashboard = await self._aggregator.export_executive_dashboard(
-            tenant_id=tenant_id,
-            vendor_ids=vendor_ids,
-            period_days=period_days,
-        )
+        for entry in feed_data:
+            vendor_name = entry.get("vendor_name", "")
+            vendors = await self._vendor_repo.find_by_name_fuzzy(tenant_id, vendor_name)
+
+            for vendor in vendors:
+                alert = await self._monitoring_repo.create_alert(
+                    tenant_id=tenant_id,
+                    vendor_id=vendor.id,
+                    alert_type=entry.get("alert_type", feed_type),
+                    severity=entry.get("severity", "medium"),
+                    source=entry.get("source", feed_type),
+                    description=entry.get("description", ""),
+                    recommended_action=entry.get("recommended_action"),
+                )
+                alerts.append(alert)
+
+                await self._event_publisher.publish(
+                    Topics.VENDOR_EVENTS,
+                    {
+                        "event_type": "vendor.intelligence_feed_alert",
+                        "alert_id": str(alert.id),
+                        "vendor_id": str(vendor.id),
+                        "tenant_id": str(tenant_id),
+                        "feed_type": feed_type,
+                    },
+                )
 
         logger.info(
-            "Executive vendor dashboard compiled",
+            "intelligence_feed_ingested",
             tenant_id=str(tenant_id),
-            vendor_count=len(vendor_ids),
-            period_days=period_days,
+            feed_type=feed_type,
+            entries=len(feed_data),
+            alerts_created=len(alerts),
         )
-
-        return dashboard
+        return alerts

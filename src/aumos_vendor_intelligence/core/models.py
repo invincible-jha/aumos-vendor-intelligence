@@ -4,11 +4,17 @@ All tables use the `vin_` prefix. Tenant-scoped tables extend AumOSModel
 which supplies id (UUID), tenant_id, created_at, and updated_at columns.
 
 Domain model:
-  Vendor              — AI vendor profile with compatibility and portability metadata
-  VendorEvaluation    — Multi-criteria evaluation score for a vendor
-  LockInAssessment    — Vendor lock-in risk analysis result
-  Contract            — Vendor contract metadata and risk analysis
-  InsuranceGap        — Identified insurance gap from vendor usage
+  Vendor                     — AI vendor profile with compatibility and portability metadata
+  VendorEvaluation           — Multi-criteria evaluation score for a vendor
+  LockInAssessment           — Vendor lock-in risk analysis result
+  Contract                   — Vendor contract metadata and risk analysis
+  InsuranceGap               — Identified insurance gap from vendor usage
+  VinQuestionnaireTemplate   — Security questionnaire template library
+  VinQuestionnaireSubmission — Questionnaire sent to a vendor contact
+  VinQuestionnaireLink       — Tokenised public link for vendor response
+  VinMonitoringAlert         — Continuous vendor monitoring alert
+  VinIso42001Control         — ISO 42001 AI Management System control library
+  VinVendorIso42001Assessment — Per-vendor ISO 42001 compliance assessment
 """
 
 import uuid
@@ -16,6 +22,7 @@ from datetime import datetime
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -27,7 +34,7 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
-from aumos_common.database import AumOSModel
+from aumos_common.database import AumOSModel, Base
 
 
 class Vendor(AumOSModel):
@@ -569,4 +576,315 @@ class InsuranceGap(AumOSModel):
     contract: Mapped["Contract | None"] = relationship(
         "Contract",
         back_populates="insurance_gaps",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GAP-268: Vendor Security Questionnaire System
+# ---------------------------------------------------------------------------
+
+
+class VinQuestionnaireTemplate(AumOSModel):
+    """Security questionnaire template defining a set of questions.
+
+    Templates are tenant-specific and versioned. Questions are stored as JSONB
+    to allow flexible question schemas with evidence expectations and weights.
+
+    Table: vin_questionnaire_templates
+    """
+
+    __tablename__ = "vin_questionnaire_templates"
+
+    name: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="Human-readable template name",
+    )
+    category: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        comment="security_posture | data_portability | ai_safety | custom",
+    )
+    questions: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        comment=(
+            "Question definitions: [{\"id\": \"...\", \"text\": \"...\", "
+            "\"category\": \"...\", \"expected_evidence\": \"SOC2 report\", \"weight\": 0.1}]"
+        ),
+    )
+    version: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=1,
+        comment="Template version number, incremented on significant changes",
+    )
+    is_active: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=True,
+        comment="Whether this template is available for new distributions",
+    )
+
+
+class VinQuestionnaireSubmission(AumOSModel):
+    """A questionnaire sent to a specific vendor contact.
+
+    Tracks the full lifecycle from distribution through AI review.
+
+    Status transitions:
+        sent → in_progress → completed → reviewed
+
+    Table: vin_questionnaire_submissions
+    """
+
+    __tablename__ = "vin_questionnaire_submissions"
+
+    vendor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+        comment="Vendor this questionnaire was sent to",
+    )
+    template_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        comment="Questionnaire template used for this submission",
+    )
+    status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        default="sent",
+        index=True,
+        comment="sent | in_progress | completed | overdue | reviewed",
+    )
+    vendor_contact_email: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="Email address the questionnaire was sent to",
+    )
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Timestamp when the questionnaire link was sent",
+    )
+    due_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Deadline for vendor response",
+    )
+    completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp when vendor submitted all responses",
+    )
+    vendor_responses: Mapped[dict] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=dict,
+        comment="Vendor-provided answers keyed by question ID",
+    )
+    ai_review_scores: Mapped[dict | None] = mapped_column(
+        JSONB,
+        nullable=True,
+        comment="AI-generated scores by criterion category from LLM review",
+    )
+    review_notes: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Operator notes after reviewing the AI assessment",
+    )
+
+
+class VinQuestionnaireLink(Base):
+    """Public unauthenticated token link for vendor questionnaire response.
+
+    Not tenant-scoped (extends Base not AumOSModel) because it must be
+    accessible without authentication via public endpoints.
+
+    Table: vin_questionnaire_links
+    """
+
+    __tablename__ = "vin_questionnaire_links"
+
+    id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        default=uuid.uuid4,
+        comment="Primary key",
+    )
+    submission_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+        comment="Submission this link grants access to",
+    )
+    token: Mapped[str] = mapped_column(
+        String(128),
+        unique=True,
+        nullable=False,
+        index=True,
+        comment="URL-safe random token (48 bytes base64url encoded)",
+    )
+    expires_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        comment="Token expiry timestamp",
+    )
+    used: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        default=False,
+        comment="True once the vendor has submitted responses via this link",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GAP-269: Continuous Vendor Monitoring
+# ---------------------------------------------------------------------------
+
+
+class VinMonitoringAlert(AumOSModel):
+    """A vendor monitoring alert generated by continuous intelligence feeds.
+
+    Alert types correspond to external intelligence sources:
+        breach_reported   — breach database match for vendor domain
+        soc2_expired      — SOC2 certification expiry date passed
+        regulatory_action — regulatory enforcement action detected
+        cert_expired      — security certification expired
+
+    Table: vin_monitoring_alerts
+    """
+
+    __tablename__ = "vin_monitoring_alerts"
+
+    vendor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+        comment="Vendor this alert concerns",
+    )
+    alert_type: Mapped[str] = mapped_column(
+        String(100),
+        nullable=False,
+        comment="breach_reported | soc2_expired | regulatory_action | cert_expired",
+    )
+    severity: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        comment="low | medium | high | critical",
+    )
+    source: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="Intelligence feed source identifier (e.g. HaveIBeenPwned, SEC RSS)",
+    )
+    description: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="Human-readable description of the detected risk change",
+    )
+    affected_evaluation_ids: Mapped[list] = mapped_column(
+        JSONB,
+        nullable=False,
+        default=list,
+        comment="UUIDs of vendor evaluations affected by this alert",
+    )
+    recommended_action: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Recommended remediation or review action",
+    )
+    resolved_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="Timestamp when the alert was resolved or dismissed",
+    )
+
+
+# ---------------------------------------------------------------------------
+# GAP-270: ISO 42001 Compliance Mapping
+# ---------------------------------------------------------------------------
+
+
+class VinIso42001Control(Base):
+    """ISO 42001 AI Management System control library.
+
+    Platform-wide reference data, not tenant-scoped. Contains all Annex A
+    controls from the ISO/IEC 42001:2023 standard.
+
+    Table: vin_iso42001_controls
+    """
+
+    __tablename__ = "vin_iso42001_controls"
+
+    id: Mapped[str] = mapped_column(
+        String(20),
+        primary_key=True,
+        comment="Control identifier, e.g. A.2.1, A.5.4, A.6.1.2",
+    )
+    section: Mapped[str] = mapped_column(
+        String(255),
+        nullable=False,
+        comment="Standard section name, e.g. AI system impact assessment",
+    )
+    title: Mapped[str] = mapped_column(
+        String(500),
+        nullable=False,
+        comment="Control title from the standard",
+    )
+    description: Mapped[str] = mapped_column(
+        Text,
+        nullable=False,
+        comment="Full control description and intent",
+    )
+    control_type: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        comment="organizational | technical | people | physical",
+    )
+    mandatory: Mapped[bool] = mapped_column(
+        Boolean,
+        nullable=False,
+        comment="True for mandatory controls, False for conditional",
+    )
+
+
+class VinVendorIso42001Assessment(AumOSModel):
+    """Per-vendor ISO 42001 compliance assessment record.
+
+    Maps vendor questionnaire evidence to individual ISO 42001 Annex A
+    controls and records the compliance determination.
+
+    Table: vin_vendor_iso42001_assessments
+    """
+
+    __tablename__ = "vin_vendor_iso42001_assessments"
+
+    vendor_id: Mapped[uuid.UUID] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=False,
+        index=True,
+        comment="Vendor being assessed",
+    )
+    control_id: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        comment="ISO 42001 control identifier (references vin_iso42001_controls.id)",
+    )
+    compliance_status: Mapped[str] = mapped_column(
+        String(50),
+        nullable=False,
+        comment="compliant | partially_compliant | non_compliant | not_applicable",
+    )
+    evidence: Mapped[str | None] = mapped_column(
+        Text,
+        nullable=True,
+        comment="Evidence supporting the compliance determination",
+    )
+    assessed_from_questionnaire_id: Mapped[uuid.UUID | None] = mapped_column(
+        UUID(as_uuid=True),
+        nullable=True,
+        comment="Questionnaire submission that provided the evidence for this assessment",
     )

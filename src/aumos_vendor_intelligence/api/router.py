@@ -23,8 +23,24 @@ from aumos_vendor_intelligence.api.schemas import (
     InsuranceCheckResponse,
     InsuranceGapResponse,
     InsuranceGapStatusUpdate,
+    IntelligenceFeedIngestRequest,
+    IntelligenceFeedIngestResponse,
+    Iso42001AssessmentRequest,
+    Iso42001AssessmentResponse,
+    Iso42001ComplianceReportResponse,
+    Iso42001ControlResponse,
     LockInAssessmentRequest,
     LockInAssessmentResponse,
+    MonitoringAlertResponse,
+    NegotiationPlaybookResponse,
+    QuestionnaireDistributeRequest,
+    QuestionnaireDistributeResponse,
+    QuestionnaireSubmissionResponse,
+    QuestionnaireSubmitRequest,
+    QuestionnaireTemplateCreateRequest,
+    QuestionnaireTemplateResponse,
+    SaasSpendSyncRequest,
+    SaasSpendSyncResponse,
     VendorCompareResponse,
     VendorCreateRequest,
     VendorListResponse,
@@ -33,7 +49,13 @@ from aumos_vendor_intelligence.api.schemas import (
 from aumos_vendor_intelligence.core.services import (
     ContractAnalyzerService,
     InsuranceCheckerService,
+    Iso42001ComplianceService,
     LockInAssessorService,
+    NegotiationPlaybookService,
+    QuestionnaireService,
+    SaasSpendService,
+    VendorIntelligenceFeedService,
+    VendorMonitoringService,
     VendorScorerService,
 )
 
@@ -93,6 +115,36 @@ def _get_insurance_checker(request: Request) -> InsuranceCheckerService:
         InsuranceCheckerService instance.
     """
     return request.app.state.insurance_checker_service  # type: ignore[no-any-return]
+
+
+def _get_questionnaire_service(request: Request) -> QuestionnaireService:
+    """Retrieve QuestionnaireService from app state."""
+    return request.app.state.questionnaire_service  # type: ignore[no-any-return]
+
+
+def _get_monitoring_service(request: Request) -> VendorMonitoringService:
+    """Retrieve VendorMonitoringService from app state."""
+    return request.app.state.vendor_monitoring_service  # type: ignore[no-any-return]
+
+
+def _get_iso42001_service(request: Request) -> Iso42001ComplianceService:
+    """Retrieve Iso42001ComplianceService from app state."""
+    return request.app.state.iso42001_service  # type: ignore[no-any-return]
+
+
+def _get_negotiation_service(request: Request) -> NegotiationPlaybookService:
+    """Retrieve NegotiationPlaybookService from app state."""
+    return request.app.state.negotiation_playbook_service  # type: ignore[no-any-return]
+
+
+def _get_saas_spend_service(request: Request) -> SaasSpendService:
+    """Retrieve SaasSpendService from app state."""
+    return request.app.state.saas_spend_service  # type: ignore[no-any-return]
+
+
+def _get_intelligence_feed_service(request: Request) -> VendorIntelligenceFeedService:
+    """Retrieve VendorIntelligenceFeedService from app state."""
+    return request.app.state.vendor_intelligence_feed_service  # type: ignore[no-any-return]
 
 
 def _tenant_id_from_request(request: Request) -> uuid.UUID:
@@ -659,3 +711,467 @@ async def update_insurance_gap(
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
 
     return InsuranceGapResponse.model_validate(gap)
+
+
+# ---------------------------------------------------------------------------
+# Questionnaire endpoints (GAP-268)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/questionnaires/templates",
+    response_model=QuestionnaireTemplateResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Create questionnaire template",
+    description="Create a new vendor security questionnaire template.",
+)
+async def create_questionnaire_template(
+    request_body: QuestionnaireTemplateCreateRequest,
+    request: Request,
+    service: QuestionnaireService = Depends(_get_questionnaire_service),
+) -> QuestionnaireTemplateResponse:
+    """Create a questionnaire template.
+
+    Args:
+        request_body: Template name, questions, and category.
+        request: FastAPI request for tenant extraction.
+        service: QuestionnaireService dependency.
+
+    Returns:
+        QuestionnaireTemplateResponse for the new template.
+    """
+    tenant_id = _tenant_id_from_request(request)
+    template = await service.create_template(
+        tenant_id=tenant_id,
+        name=request_body.name,
+        questions=[q.model_dump() for q in request_body.questions],
+        category=request_body.category,
+        created_by=None,
+    )
+    return QuestionnaireTemplateResponse.model_validate(template)
+
+
+@router.get(
+    "/questionnaires/templates",
+    response_model=list[QuestionnaireTemplateResponse],
+    summary="List questionnaire templates",
+    description="List all questionnaire templates for the current tenant.",
+)
+async def list_questionnaire_templates(
+    category: str | None = None,
+    request: Request = ...,  # type: ignore[assignment]
+    service: QuestionnaireService = Depends(_get_questionnaire_service),
+) -> list[QuestionnaireTemplateResponse]:
+    """List questionnaire templates.
+
+    Args:
+        category: Optional category filter.
+        request: FastAPI request for tenant extraction.
+        service: QuestionnaireService dependency.
+
+    Returns:
+        List of QuestionnaireTemplateResponse instances.
+    """
+    tenant_id = _tenant_id_from_request(request)
+    templates = await service.list_templates(tenant_id=tenant_id, category=category)
+    return [QuestionnaireTemplateResponse.model_validate(t) for t in templates]
+
+
+@router.post(
+    "/questionnaires/distribute",
+    response_model=QuestionnaireDistributeResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Distribute questionnaire",
+    description=(
+        "Send a security questionnaire to a vendor contact. "
+        "Generates a secure token-based access link."
+    ),
+)
+async def distribute_questionnaire(
+    request_body: QuestionnaireDistributeRequest,
+    request: Request,
+    service: QuestionnaireService = Depends(_get_questionnaire_service),
+) -> QuestionnaireDistributeResponse:
+    """Distribute a questionnaire to a vendor contact.
+
+    Args:
+        request_body: Vendor ID, template ID, contact email, and expiry.
+        request: FastAPI request for tenant extraction.
+        service: QuestionnaireService dependency.
+
+    Returns:
+        QuestionnaireDistributeResponse with submission record and access URL.
+
+    Raises:
+        HTTPException 404: If vendor or template not found.
+    """
+    tenant_id = _tenant_id_from_request(request)
+
+    try:
+        result = await service.distribute_questionnaire(
+            tenant_id=tenant_id,
+            vendor_id=request_body.vendor_id,
+            template_id=request_body.template_id,
+            vendor_contact_email=request_body.vendor_contact_email,
+            expiry_days=request_body.expiry_days,
+            requested_by=None,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    return result
+
+
+@router.post(
+    "/questionnaires/submit/{token}",
+    response_model=QuestionnaireSubmissionResponse,
+    summary="Submit questionnaire responses",
+    description="Public endpoint: vendor submits responses using their token link.",
+)
+async def submit_questionnaire_responses(
+    token: str,
+    request_body: QuestionnaireSubmitRequest,
+    service: QuestionnaireService = Depends(_get_questionnaire_service),
+) -> QuestionnaireSubmissionResponse:
+    """Submit vendor responses via public token link.
+
+    Args:
+        token: Secure access token from the invitation email.
+        request_body: Map of question_id to response values.
+        service: QuestionnaireService dependency.
+
+    Returns:
+        Updated QuestionnaireSubmissionResponse.
+
+    Raises:
+        HTTPException 404: If token not found or expired.
+    """
+    try:
+        submission = await service.submit_vendor_responses(
+            token=token,
+            responses=request_body.responses,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    return QuestionnaireSubmissionResponse.model_validate(submission)
+
+
+@router.get(
+    "/questionnaires/submissions",
+    response_model=list[QuestionnaireSubmissionResponse],
+    summary="List questionnaire submissions",
+    description="List questionnaire submissions for the current tenant.",
+)
+async def list_questionnaire_submissions(
+    vendor_id: uuid.UUID | None = None,
+    sub_status: str | None = None,
+    request: Request = ...,  # type: ignore[assignment]
+    service: QuestionnaireService = Depends(_get_questionnaire_service),
+) -> list[QuestionnaireSubmissionResponse]:
+    """List questionnaire submissions.
+
+    Args:
+        vendor_id: Optional vendor UUID filter.
+        sub_status: Optional status filter.
+        request: FastAPI request for tenant extraction.
+        service: QuestionnaireService dependency.
+
+    Returns:
+        List of QuestionnaireSubmissionResponse instances.
+    """
+    tenant_id = _tenant_id_from_request(request)
+    submissions = await service.questionnaire_repo.list_submissions(
+        tenant_id=tenant_id,
+        vendor_id=vendor_id,
+        status=sub_status,
+    )
+    return [QuestionnaireSubmissionResponse.model_validate(s) for s in submissions]
+
+
+# ---------------------------------------------------------------------------
+# Monitoring alert endpoints (GAP-269)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/vendors/{vendor_id}/monitoring/run",
+    response_model=list[MonitoringAlertResponse],
+    status_code=status.HTTP_201_CREATED,
+    summary="Run vendor monitoring cycle",
+    description="Trigger a monitoring cycle for a vendor across all intelligence sources.",
+)
+async def run_vendor_monitoring(
+    vendor_id: uuid.UUID,
+    request: Request,
+    service: VendorMonitoringService = Depends(_get_monitoring_service),
+) -> list[MonitoringAlertResponse]:
+    """Run a vendor monitoring cycle.
+
+    Args:
+        vendor_id: Vendor UUID to monitor.
+        request: FastAPI request for tenant extraction.
+        service: VendorMonitoringService dependency.
+
+    Returns:
+        List of MonitoringAlertResponse instances for newly created alerts.
+
+    Raises:
+        HTTPException 404: If vendor not found.
+    """
+    tenant_id = _tenant_id_from_request(request)
+
+    try:
+        alerts = await service.run_monitoring_cycle(vendor_id=vendor_id, tenant_id=tenant_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    return [MonitoringAlertResponse.model_validate(a) for a in alerts]
+
+
+@router.get(
+    "/vendors/{vendor_id}/monitoring/alerts",
+    response_model=list[MonitoringAlertResponse],
+    summary="List monitoring alerts",
+    description="List monitoring alerts for a vendor.",
+)
+async def list_monitoring_alerts(
+    vendor_id: uuid.UUID,
+    alert_status: str | None = None,
+    request: Request = ...,  # type: ignore[assignment]
+    service: VendorMonitoringService = Depends(_get_monitoring_service),
+) -> list[MonitoringAlertResponse]:
+    """List monitoring alerts for a vendor.
+
+    Args:
+        vendor_id: Vendor UUID.
+        alert_status: Optional status filter (open | resolved).
+        request: FastAPI request for tenant extraction.
+        service: VendorMonitoringService dependency.
+
+    Returns:
+        List of MonitoringAlertResponse instances.
+    """
+    tenant_id = _tenant_id_from_request(request)
+    alerts = await service.list_alerts(
+        vendor_id=vendor_id, tenant_id=tenant_id, status=alert_status
+    )
+    return [MonitoringAlertResponse.model_validate(a) for a in alerts]
+
+
+# ---------------------------------------------------------------------------
+# ISO 42001 compliance endpoints (GAP-270)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/iso42001/controls",
+    response_model=list[Iso42001ControlResponse],
+    summary="List ISO 42001 controls",
+    description="List all ISO/IEC 42001:2023 AI Management System controls.",
+)
+async def list_iso42001_controls(
+    domain: str | None = None,
+    service: Iso42001ComplianceService = Depends(_get_iso42001_service),
+) -> list[Iso42001ControlResponse]:
+    """List ISO 42001 control library.
+
+    Args:
+        domain: Optional domain filter (governance | risk_management | data_management |
+            transparency | accountability).
+        service: Iso42001ComplianceService dependency.
+
+    Returns:
+        List of Iso42001ControlResponse instances.
+    """
+    controls = await service.list_controls(domain=domain)
+    return [Iso42001ControlResponse.model_validate(c) for c in controls]
+
+
+@router.post(
+    "/vendors/{vendor_id}/iso42001/assess",
+    response_model=list[Iso42001AssessmentResponse],
+    status_code=status.HTTP_201_CREATED,
+    summary="Assess vendor ISO 42001 compliance",
+    description=(
+        "Record a vendor's compliance status for one or more ISO 42001 controls. "
+        "Upserts assessments per (vendor, control, tenant)."
+    ),
+)
+async def assess_vendor_iso42001(
+    vendor_id: uuid.UUID,
+    request_body: Iso42001AssessmentRequest,
+    request: Request,
+    service: Iso42001ComplianceService = Depends(_get_iso42001_service),
+) -> list[Iso42001AssessmentResponse]:
+    """Assess a vendor against ISO 42001 controls.
+
+    Args:
+        vendor_id: Vendor UUID to assess.
+        request_body: List of control assessments with status and evidence.
+        request: FastAPI request for tenant extraction.
+        service: Iso42001ComplianceService dependency.
+
+    Returns:
+        List of Iso42001AssessmentResponse instances.
+    """
+    tenant_id = _tenant_id_from_request(request)
+    assessments = await service.assess_vendor(
+        vendor_id=vendor_id,
+        tenant_id=tenant_id,
+        control_assessments=request_body.control_assessments,
+        assessed_by=None,
+    )
+    return [Iso42001AssessmentResponse.model_validate(a) for a in assessments]
+
+
+@router.get(
+    "/vendors/{vendor_id}/iso42001/report",
+    response_model=Iso42001ComplianceReportResponse,
+    summary="Get ISO 42001 compliance report",
+    description="Retrieve an aggregated ISO 42001 compliance report for a vendor.",
+)
+async def get_iso42001_report(
+    vendor_id: uuid.UUID,
+    request: Request,
+    service: Iso42001ComplianceService = Depends(_get_iso42001_service),
+) -> Iso42001ComplianceReportResponse:
+    """Get ISO 42001 compliance report for a vendor.
+
+    Args:
+        vendor_id: Vendor UUID.
+        request: FastAPI request for tenant extraction.
+        service: Iso42001ComplianceService dependency.
+
+    Returns:
+        Iso42001ComplianceReportResponse with aggregated compliance metrics.
+    """
+    tenant_id = _tenant_id_from_request(request)
+    report = await service.get_compliance_report(vendor_id=vendor_id, tenant_id=tenant_id)
+    return Iso42001ComplianceReportResponse(**report)
+
+
+# ---------------------------------------------------------------------------
+# Negotiation playbook endpoints (GAP-271)
+# ---------------------------------------------------------------------------
+
+
+@router.get(
+    "/vendors/{vendor_id}/negotiation-playbook",
+    response_model=NegotiationPlaybookResponse,
+    summary="Generate negotiation playbook",
+    description=(
+        "Generate an AI-backed negotiation playbook for a vendor "
+        "using evaluation scores, lock-in assessment, and contract risk data."
+    ),
+)
+async def get_negotiation_playbook(
+    vendor_id: uuid.UUID,
+    request: Request,
+    service: NegotiationPlaybookService = Depends(_get_negotiation_service),
+) -> NegotiationPlaybookResponse:
+    """Generate a negotiation playbook for a vendor.
+
+    Args:
+        vendor_id: Vendor UUID to generate playbook for.
+        request: FastAPI request for tenant extraction.
+        service: NegotiationPlaybookService dependency.
+
+    Returns:
+        NegotiationPlaybookResponse with strategy and leverage points.
+
+    Raises:
+        HTTPException 404: If vendor not found.
+    """
+    tenant_id = _tenant_id_from_request(request)
+
+    try:
+        playbook = await service.generate_playbook(vendor_id=vendor_id, tenant_id=tenant_id)
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    return NegotiationPlaybookResponse(
+        vendor_id=vendor_id,
+        **{k: v for k, v in playbook.items() if k != "context_hash"},
+    )
+
+
+# ---------------------------------------------------------------------------
+# SaaS spend endpoints (GAP-272)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/saas-spend/sync",
+    response_model=SaasSpendSyncResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Sync SaaS spend data",
+    description="Sync SaaS spend records for vendor cost tracking and optimisation.",
+)
+async def sync_saas_spend(
+    request_body: SaasSpendSyncRequest,
+    request: Request,
+    service: SaasSpendService = Depends(_get_saas_spend_service),
+) -> SaasSpendSyncResponse:
+    """Sync SaaS spend data.
+
+    Args:
+        request_body: Spend source and list of spend records.
+        request: FastAPI request for tenant extraction.
+        service: SaasSpendService dependency.
+
+    Returns:
+        SaasSpendSyncResponse with processed record counts.
+    """
+    tenant_id = _tenant_id_from_request(request)
+    result = await service.sync_spend_data(
+        tenant_id=tenant_id,
+        source=request_body.source,
+        spend_records=request_body.spend_records,
+    )
+    return SaasSpendSyncResponse(**result)
+
+
+# ---------------------------------------------------------------------------
+# Intelligence feed endpoints (GAP-273)
+# ---------------------------------------------------------------------------
+
+
+@router.post(
+    "/intelligence-feeds/ingest",
+    response_model=IntelligenceFeedIngestResponse,
+    status_code=status.HTTP_201_CREATED,
+    summary="Ingest intelligence feed",
+    description="Ingest a vendor intelligence feed and create monitoring alerts.",
+)
+async def ingest_intelligence_feed(
+    request_body: IntelligenceFeedIngestRequest,
+    request: Request,
+    service: VendorIntelligenceFeedService = Depends(_get_intelligence_feed_service),
+) -> IntelligenceFeedIngestResponse:
+    """Ingest a vendor intelligence feed.
+
+    Args:
+        request_body: Feed source, vendor ID, and raw feed payload.
+        request: FastAPI request for tenant extraction.
+        service: VendorIntelligenceFeedService dependency.
+
+    Returns:
+        IntelligenceFeedIngestResponse with ingested alert count.
+
+    Raises:
+        HTTPException 404: If vendor not found.
+    """
+    tenant_id = _tenant_id_from_request(request)
+
+    try:
+        result = await service.ingest_intelligence_feed(
+            vendor_id=request_body.vendor_id,
+            tenant_id=tenant_id,
+            feed_source=request_body.feed_source,
+            feed_data=request_body.feed_data,
+        )
+    except NotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=str(exc)) from exc
+
+    return IntelligenceFeedIngestResponse(**result)

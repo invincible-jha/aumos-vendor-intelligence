@@ -101,4 +101,60 @@ class Settings(AumOSSettings):
         description="Maximum retry attempts for HTTP calls to upstream services",
     )
 
+    # ---------------------------------------------------------------------------
+    # Questionnaire settings (GAP-268)
+    # ---------------------------------------------------------------------------
+    questionnaire_base_url: str = Field(
+        default="https://vendor-portal.aumos.io/questionnaires",
+        description="Base URL for public questionnaire access links sent to vendor contacts",
+    )
+    questionnaire_default_expiry_days: int = Field(
+        default=14,
+        description="Default number of days before a questionnaire access link expires",
+    )
+    questionnaire_ai_model: str = Field(
+        default="claude-opus-4-6",
+        description="LLM model ID used for AI review of questionnaire responses",
+    )
+
+    # ---------------------------------------------------------------------------
+    # Vendor monitoring settings (GAP-269)
+    # ---------------------------------------------------------------------------
+    monitoring_breach_db_api_key: str = Field(
+        default="",
+        description="API key for the breach intelligence database service",
+    )
+    monitoring_soc2_registry_url: str = Field(
+        default="https://cert-registry.internal",
+        description="URL of the internal SOC 2 certification registry",
+    )
+    monitoring_regulatory_feed_url: str = Field(
+        default="https://regulatory-feed.internal",
+        description="URL of the regulatory intelligence feed",
+    )
+    monitoring_soc2_expiry_warning_days: int = Field(
+        default=60,
+        description="Days before SOC 2 expiry to raise a warning alert",
+    )
+
+    # ---------------------------------------------------------------------------
+    # ISO 42001 settings (GAP-270)
+    # ---------------------------------------------------------------------------
+    iso42001_staleness_threshold_days: int = Field(
+        default=365,
+        description="Number of days after which an ISO 42001 assessment is considered stale",
+    )
+
+    # ---------------------------------------------------------------------------
+    # Negotiation playbook settings (GAP-271)
+    # ---------------------------------------------------------------------------
+    negotiation_playbook_llm_model: str = Field(
+        default="claude-opus-4-6",
+        description="LLM model ID used for negotiation playbook generation",
+    )
+    negotiation_playbook_max_tokens: int = Field(
+        default=4096,
+        description="Maximum tokens for negotiation playbook LLM calls",
+    )
+
     model_config = SettingsConfigDict(env_prefix="AUMOS_VENDOR_")

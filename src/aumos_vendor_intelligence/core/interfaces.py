@@ -14,6 +14,12 @@ from aumos_vendor_intelligence.core.models import (
     LockInAssessment,
     Vendor,
     VendorEvaluation,
+    VinIso42001Control,
+    VinMonitoringAlert,
+    VinQuestionnaireLink,
+    VinQuestionnaireSubmission,
+    VinQuestionnaireTemplate,
+    VinVendorIso42001Assessment,
 )
 
 
@@ -808,4 +814,248 @@ class IVendorDashboardAggregator(Protocol):
         period_days: int,
     ) -> dict[str, Any]:
         """Export a complete executive dashboard payload for the vendor portfolio."""
+        ...
+
+
+# ---------------------------------------------------------------------------
+# New interfaces for GAPs 268-273
+# ---------------------------------------------------------------------------
+
+
+@runtime_checkable
+class IQuestionnaireRepository(Protocol):
+    """Persistence interface for vendor security questionnaire entities."""
+
+    async def create_template(
+        self,
+        tenant_id: uuid.UUID,
+        name: str,
+        category: str,
+        questions: list[dict[str, Any]],
+    ) -> VinQuestionnaireTemplate:
+        """Create a new questionnaire template.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            name: Template name.
+            category: Template category.
+            questions: List of question definition dicts.
+
+        Returns:
+            Newly created VinQuestionnaireTemplate.
+        """
+        ...
+
+    async def get_template(
+        self, template_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> VinQuestionnaireTemplate | None:
+        """Retrieve a questionnaire template by UUID."""
+        ...
+
+    async def list_templates(
+        self, tenant_id: uuid.UUID
+    ) -> list[VinQuestionnaireTemplate]:
+        """List all active questionnaire templates for a tenant."""
+        ...
+
+    async def create_submission(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID,
+        template_id: uuid.UUID,
+        vendor_contact_email: str,
+        sent_at: datetime,
+        due_at: datetime,
+        token: str,
+    ) -> VinQuestionnaireSubmission:
+        """Create a submission and its associated tokenised link.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            vendor_id: Vendor UUID.
+            template_id: Template UUID.
+            vendor_contact_email: Recipient email.
+            sent_at: Send timestamp.
+            due_at: Response deadline.
+            token: URL-safe token for the public link.
+
+        Returns:
+            Newly created VinQuestionnaireSubmission in 'sent' status.
+        """
+        ...
+
+    async def get_submission(
+        self, submission_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> VinQuestionnaireSubmission | None:
+        """Retrieve a questionnaire submission by UUID."""
+        ...
+
+    async def list_submissions_for_vendor(
+        self, vendor_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> list[VinQuestionnaireSubmission]:
+        """List all questionnaire submissions for a vendor."""
+        ...
+
+    async def get_link_by_token(self, token: str) -> VinQuestionnaireLink | None:
+        """Retrieve a questionnaire link by its URL-safe token."""
+        ...
+
+    async def mark_link_used(self, link_id: uuid.UUID) -> None:
+        """Mark a questionnaire link as used."""
+        ...
+
+    async def record_responses(
+        self,
+        submission_id: uuid.UUID,
+        responses: dict[str, Any],
+        completed_at: datetime,
+    ) -> VinQuestionnaireSubmission:
+        """Record vendor responses against a submission.
+
+        Args:
+            submission_id: Submission UUID.
+            responses: Vendor answers keyed by question ID.
+            completed_at: Completion timestamp.
+
+        Returns:
+            Updated submission in 'completed' status.
+        """
+        ...
+
+    async def update_ai_review_scores(
+        self,
+        submission_id: uuid.UUID,
+        tenant_id: uuid.UUID,
+        scores: dict[str, float],
+    ) -> VinQuestionnaireSubmission:
+        """Store AI-generated review scores on a submission."""
+        ...
+
+
+@runtime_checkable
+class IMonitoringAlertRepository(Protocol):
+    """Persistence interface for VinMonitoringAlert entities."""
+
+    async def create_alert(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID,
+        alert_type: str,
+        severity: str,
+        source: str,
+        description: str,
+        recommended_action: str | None,
+    ) -> VinMonitoringAlert:
+        """Create a new monitoring alert.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            vendor_id: Vendor UUID.
+            alert_type: Alert category identifier.
+            severity: low | medium | high | critical.
+            source: Feed source identifier.
+            description: Human-readable alert description.
+            recommended_action: Optional recommended action.
+
+        Returns:
+            Newly created VinMonitoringAlert.
+        """
+        ...
+
+    async def list_alerts(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID | None,
+        resolved: bool | None,
+    ) -> list[VinMonitoringAlert]:
+        """List monitoring alerts with optional filters."""
+        ...
+
+    async def resolve_alert(
+        self, alert_id: uuid.UUID, tenant_id: uuid.UUID, resolved_at: datetime
+    ) -> VinMonitoringAlert:
+        """Mark an alert as resolved."""
+        ...
+
+
+@runtime_checkable
+class IVendorMonitoringAdapter(Protocol):
+    """Interface for external intelligence feed adapters."""
+
+    async def check_vendor(self, vendor: Vendor) -> list[dict[str, Any]]:
+        """Check a vendor against this intelligence feed.
+
+        Args:
+            vendor: Vendor to check.
+
+        Returns:
+            List of alert data dicts for any detected issues. Empty if no issues.
+        """
+        ...
+
+
+@runtime_checkable
+class IIso42001Repository(Protocol):
+    """Persistence interface for ISO 42001 control library and assessments."""
+
+    async def list_all_controls(self) -> list[VinIso42001Control]:
+        """List all ISO 42001 Annex A controls (platform-wide)."""
+        ...
+
+    async def get_control(self, control_id: str) -> VinIso42001Control | None:
+        """Retrieve a single ISO 42001 control by its identifier."""
+        ...
+
+    async def upsert_vendor_assessment(
+        self,
+        tenant_id: uuid.UUID,
+        vendor_id: uuid.UUID,
+        control_id: str,
+        compliance_status: str,
+        evidence: str | None,
+        assessed_from_questionnaire_id: uuid.UUID | None,
+    ) -> VinVendorIso42001Assessment:
+        """Create or update a vendor ISO 42001 assessment for one control.
+
+        Args:
+            tenant_id: Owning tenant UUID.
+            vendor_id: Vendor UUID.
+            control_id: ISO 42001 control ID.
+            compliance_status: compliant | partially_compliant | non_compliant | not_applicable.
+            evidence: Optional evidence text.
+            assessed_from_questionnaire_id: Optional source questionnaire UUID.
+
+        Returns:
+            Created or updated VinVendorIso42001Assessment.
+        """
+        ...
+
+    async def list_vendor_assessments(
+        self, vendor_id: uuid.UUID, tenant_id: uuid.UUID
+    ) -> list[VinVendorIso42001Assessment]:
+        """List all ISO 42001 assessments for a vendor."""
+        ...
+
+
+@runtime_checkable
+class INegotiationPlaybookGenerator(Protocol):
+    """Interface for generating vendor negotiation playbooks."""
+
+    async def generate(
+        self,
+        vendor: Vendor,
+        lock_in_assessment: LockInAssessment | None,
+        latest_contract: Contract | None,
+    ) -> dict[str, Any]:
+        """Generate a negotiation playbook from vendor data.
+
+        Args:
+            vendor: Vendor profile with evaluation scores.
+            lock_in_assessment: Current lock-in assessment or None.
+            latest_contract: Most recent contract analysis or None.
+
+        Returns:
+            Playbook dict with leverage_points, red_lines, recommended_asks,
+            and walk_away_triggers sections.
+        """
         ...

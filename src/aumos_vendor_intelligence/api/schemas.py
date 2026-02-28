@@ -450,3 +450,254 @@ class InsuranceCheckResponse(BaseModel):
     gaps: list[InsuranceGapResponse]
     coverages_checked: list[str]
     all_coverages_adequate: bool
+
+
+# ---------------------------------------------------------------------------
+# Questionnaire schemas (GAP-268)
+# ---------------------------------------------------------------------------
+
+
+class QuestionSchema(BaseModel):
+    """A single question in a questionnaire template."""
+
+    question_id: str
+    text: str
+    question_type: str = Field(
+        pattern="^(text|boolean|rating|multiple_choice|file_upload)$"
+    )
+    required: bool = True
+    options: list[str] | None = None
+
+
+class QuestionnaireTemplateCreateRequest(BaseModel):
+    """Request body for creating a questionnaire template."""
+
+    name: str = Field(..., min_length=3, max_length=255)
+    questions: list[QuestionSchema] = Field(..., min_length=1)
+    category: str = Field(
+        ...,
+        pattern="^(security|compliance|general|iso42001|soc2|gdpr)$",
+    )
+
+
+class QuestionnaireTemplateResponse(BaseModel):
+    """Response schema for a questionnaire template."""
+
+    id: uuid.UUID
+    tenant_id: uuid.UUID
+    name: str
+    category: str
+    questions: list[dict[str, Any]]
+    created_by: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class QuestionnaireDistributeRequest(BaseModel):
+    """Request body for distributing a questionnaire to a vendor contact."""
+
+    vendor_id: uuid.UUID
+    template_id: uuid.UUID
+    vendor_contact_email: str = Field(..., description="Email address of the vendor contact")
+    expiry_days: int = Field(default=14, ge=1, le=90)
+
+
+class QuestionnaireSubmissionResponse(BaseModel):
+    """Response schema for a questionnaire submission."""
+
+    id: uuid.UUID
+    vendor_id: uuid.UUID
+    template_id: uuid.UUID
+    tenant_id: uuid.UUID
+    vendor_contact_email: str
+    status: str
+    responses: dict[str, Any]
+    ai_risk_summary: str | None
+    ai_score: float | None
+    requested_by: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class QuestionnaireDistributeResponse(BaseModel):
+    """Response after distributing a questionnaire."""
+
+    submission: QuestionnaireSubmissionResponse
+    access_url: str
+    expires_at: datetime
+
+
+class QuestionnaireSubmitRequest(BaseModel):
+    """Request body for vendor submitting questionnaire responses."""
+
+    responses: dict[str, Any] = Field(..., description="Map of question_id to response value")
+
+
+# ---------------------------------------------------------------------------
+# Monitoring alert schemas (GAP-269)
+# ---------------------------------------------------------------------------
+
+
+class MonitoringAlertResponse(BaseModel):
+    """Response schema for a vendor monitoring alert."""
+
+    id: uuid.UUID
+    vendor_id: uuid.UUID
+    tenant_id: uuid.UUID
+    source: str
+    alert_type: str
+    severity: str
+    description: str
+    raw_data: dict[str, Any]
+    status: str
+    resolved_at: datetime | None
+    resolved_by: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class MonitoringAlertResolveRequest(BaseModel):
+    """Request body for resolving a monitoring alert."""
+
+    resolution_notes: str | None = Field(default=None, max_length=2000)
+
+
+# ---------------------------------------------------------------------------
+# ISO 42001 schemas (GAP-270)
+# ---------------------------------------------------------------------------
+
+
+class Iso42001ControlResponse(BaseModel):
+    """Response schema for an ISO 42001 control."""
+
+    id: uuid.UUID
+    control_id: str
+    title: str
+    description: str
+    domain: str
+    guidance: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class Iso42001AssessmentRequest(BaseModel):
+    """Request body for assessing a vendor against ISO 42001 controls."""
+
+    control_assessments: list[dict[str, Any]] = Field(
+        ...,
+        description=(
+            "List of {control_id, status, evidence, notes} dicts. "
+            "status: compliant | partial | non_compliant | not_applicable"
+        ),
+    )
+
+
+class Iso42001AssessmentResponse(BaseModel):
+    """Response schema for a vendor ISO 42001 assessment record."""
+
+    id: uuid.UUID
+    vendor_id: uuid.UUID
+    control_id: str
+    tenant_id: uuid.UUID
+    status: str
+    evidence: dict[str, Any]
+    notes: str | None
+    assessed_by: uuid.UUID | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class Iso42001ComplianceReportResponse(BaseModel):
+    """Aggregated ISO 42001 compliance report for a vendor."""
+
+    vendor_id: uuid.UUID
+    total_controls: int
+    compliant: int
+    partial: int
+    non_compliant: int
+    not_applicable: int
+    compliance_score: float
+    by_domain: dict[str, Any]
+    assessments: list[Iso42001AssessmentResponse]
+
+
+# ---------------------------------------------------------------------------
+# Negotiation playbook schemas (GAP-271)
+# ---------------------------------------------------------------------------
+
+
+class NegotiationPlaybookResponse(BaseModel):
+    """Response schema for a generated negotiation playbook."""
+
+    vendor_id: uuid.UUID
+    executive_summary: str
+    leverage_points: list[dict[str, Any]]
+    risk_mitigations: list[dict[str, Any]]
+    walk_away_conditions: list[str]
+    opening_positions: list[dict[str, Any]]
+    concession_hierarchy: list[str]
+    generated_by: str
+    model: str
+
+
+# ---------------------------------------------------------------------------
+# SaaS spend schemas (GAP-272)
+# ---------------------------------------------------------------------------
+
+
+class SaasSpendSyncRequest(BaseModel):
+    """Request body for syncing SaaS spend data."""
+
+    source: str = Field(
+        ...,
+        pattern="^(manual|csv|api_integration)$",
+        description="Spend data source type",
+    )
+    spend_records: list[dict[str, Any]] = Field(
+        ...,
+        description=(
+            "List of spend records: {vendor_id, period_month, amount_usd, "
+            "invoice_reference, currency, exchange_rate}"
+        ),
+    )
+
+
+class SaasSpendSyncResponse(BaseModel):
+    """Response after a SaaS spend sync operation."""
+
+    records_processed: int
+    records_created: int
+    records_updated: int
+    errors: list[str]
+
+
+# ---------------------------------------------------------------------------
+# Intelligence feed schemas (GAP-273)
+# ---------------------------------------------------------------------------
+
+
+class IntelligenceFeedIngestRequest(BaseModel):
+    """Request body for ingesting a vendor intelligence feed."""
+
+    feed_source: str = Field(..., description="Name of the intelligence source")
+    vendor_id: uuid.UUID
+    feed_data: dict[str, Any] = Field(..., description="Raw feed payload to ingest")
+
+
+class IntelligenceFeedIngestResponse(BaseModel):
+    """Response after ingesting an intelligence feed."""
+
+    vendor_id: uuid.UUID
+    feed_source: str
+    alerts_created: int
+    ingested_at: datetime
